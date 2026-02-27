@@ -1,0 +1,12 @@
+{
+  "tasks": {
+    "dev": "deno run --watch main.ts"
+  },
+  "fmt": {
+    "semiColons": false,
+    "proseWrap": "never"
+  },
+  "imports": {
+    "@std/assert": "jsr:@std/assert@1"
+  }
+}
