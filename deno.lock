@@ -1,18 +1,39 @@
 {
   "version": "5",
   "specifiers": {
+    "jsr:@optique/config@0.10.0": "0.10.0",
+    "jsr:@optique/config@0.10.6": "0.10.6",
+    "jsr:@optique/core@0.10": "0.10.6",
+    "jsr:@optique/core@0.10.6": "0.10.6",
     "jsr:@optique/core@0.4.4": "0.4.4",
     "jsr:@optique/core@~0.10.6": "0.10.6",
     "jsr:@optique/core@~0.4.4": "0.4.4",
     "jsr:@optique/run@*": "0.10.6",
+    "jsr:@optique/run@0.10.6": "0.10.6",
     "jsr:@optique/run@0.4.4": "0.4.4",
     "jsr:@std/assert@1": "1.0.16",
     "jsr:@std/collections@^1.1.3": "1.1.6",
     "jsr:@std/internal@^1.0.12": "1.0.12",
     "jsr:@std/toml@*": "1.0.11",
-    "jsr:@std/toml@1": "1.0.11"
+    "jsr:@std/toml@1": "1.0.11",
+    "jsr:@valibot/valibot@*": "1.2.0",
+    "npm:@standard-schema/spec@^1.1.0": "1.1.0"
   },
   "jsr": {
+    "@optique/config@0.10.0": {
+      "integrity": "5dde8d9fa9f247b0a0f7184dadcb75bb7a48444c53b60a0f0786230351026192",
+      "dependencies": [
+        "jsr:@optique/core@0.10",
+        "npm:@standard-schema/spec"
+      ]
+    },
+    "@optique/config@0.10.6": {
+      "integrity": "ac216f6fc6ebe124fc17baa7a0a7cde13a6565942e6a2ec0c34d947299c7577d",
+      "dependencies": [
+        "jsr:@optique/core@~0.10.6",
+        "npm:@standard-schema/spec"
+      ]
+    },
     "@optique/core@0.4.4": {
       "integrity": "cd40f84afe439216d1d8fedbe1ee730112b249775a18b7d3910d85c4b0c0af68"
     },
@@ -48,6 +69,14 @@
       "dependencies": [
         "jsr:@std/collections"
       ]
+    },
+    "@valibot/valibot@1.2.0": {
+      "integrity": "61c118a4d027ed55912caf381c78f0a178f335f46ad0c4bcb136498dc1ef2285"
+    }
+  },
+  "npm": {
+    "@standard-schema/spec@1.1.0": {
+      "integrity": "sha512-l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w=="
     }
   },
   "workspace": {

@@ -3,29 +3,38 @@
 import {
   argument,
   command,
-  constant,
   object,
   optional,
   option,
-} from "jsr:@optique/core@0.4.4/parser"
-import { run } from "jsr:@optique/run@0.4.4"
-import { choice, string } from "jsr:@optique/core@0.4.4/valueparser"
+} from "jsr:@optique/core@0.10.6/parser"
+import { runWith, type SourceContext } from "jsr:@optique/core@0.10.6/facade"
+import { string } from "jsr:@optique/core@0.10.6/valueparser"
+import {
+  bindConfig,
+  clearActiveConfig,
+  configKey,
+  createConfigContext,
+  setActiveConfig,
+} from "jsr:@optique/config@0.10.6"
 import { parse as parseToml } from "jsr:@std/toml@1"
+import * as v from "jsr:@valibot/valibot"
 
 interface AppConfig {
   default?: string
   author?: string
   year?: string
   token?: string
+  license?: {
+    default?: string
+    author?: string
+    year?: string
+    token?: string
+  }
 }
 
 interface License {
   key: string
   body: string
-}
-
-interface LicenseListItem {
-  key?: string
 }
 
 const APP_NAME = "license-add"
@@ -35,6 +44,19 @@ const CACHE_DIR = `${HOME_DIR}/.cache/${APP_NAME}`
 const CONFIG_PATH = `${CONFIG_DIR}/config.toml`
 const GITHUB_LICENSE_API = "https://api.github.com/licenses"
 const CURRENT_YEAR = new Date().getFullYear().toString()
+
+const ConfigSchema = v.looseObject({
+  default: v.optional(v.string()),
+  author: v.optional(v.string()),
+  year: v.optional(v.string()),
+  token: v.optional(v.string()),
+  license: v.optional(v.looseObject({
+    default: v.optional(v.string()),
+    author: v.optional(v.string()),
+    year: v.optional(v.string()),
+    token: v.optional(v.string()),
+  })),
+})
 
 const createHeaders = (token?: string): Headers => {
   const headers = new Headers({
@@ -47,6 +69,24 @@ const createHeaders = (token?: string): Headers => {
   }
 
   return headers
+}
+
+const normalizeConfigPath = (value?: string): string => {
+  if (!value || value.trim().length === 0) {
+    return CONFIG_PATH
+  }
+
+  const path = value.trim()
+
+  if (path === "~") {
+    return HOME_DIR
+  }
+
+  if (path.startsWith("~" + "/")) {
+    return `${HOME_DIR}/${path.slice(2)}`
+  }
+
+  return path
 }
 
 const ensureDirs = async () => {
@@ -88,40 +128,6 @@ const fetchLicense = async (key: string, token?: string): Promise<License> => {
   return await response.json()
 }
 
-const fetchAllLicenses = async (token?: string): Promise<Map<string, License>> => {
-  const response = await fetch(GITHUB_LICENSE_API, {
-    headers: createHeaders(token),
-  })
-
-  if (!response.ok) {
-    const body = await response.text()
-    throw new Error(`Failed to fetch licenses: ${response.status} ${response.statusText}\n${body}`)
-  }
-
-  const items = (await response.json()) as ReadonlyArray<LicenseListItem>
-  const keys = items
-    .map((item) => item.key)
-    .filter((key): key is string => typeof key === "string" && key.length > 0)
-
-  const results = await Promise.allSettled(keys.map((key) => fetchLicense(key, token)))
-
-  for (const result of results) {
-    if (result.status === "fulfilled") {
-      await writeCachedLicense(result.value)
-    }
-  }
-
-  const licenses = new Map<string, License>()
-
-  for (const result of results) {
-    if (result.status === "fulfilled") {
-      licenses.set(result.value.key, result.value)
-    }
-  }
-
-  return licenses
-}
-
 const getCachedLicenseKeys = async (): Promise<readonly string[]> => {
   try {
     const keys: string[] = []
@@ -147,50 +153,116 @@ const getCachedLicenseKeys = async (): Promise<readonly string[]> => {
   }
 }
 
-const ensureCache = async (token?: string): Promise<void> => {
-  try {
-    await fetchAllLicenses(token)
-  } catch (error) {
-    const existingKeys = await getCachedLicenseKeys()
-    if (existingKeys.length === 0) {
-      throw error
-    }
+const buildConfig = (parsed: unknown): AppConfig => {
+  if (typeof parsed !== "object" || parsed === null) {
+    return {}
+  }
+
+  const config = parsed as Record<string, unknown>
+  const nested =
+    typeof config.license === "object" &&
+      config.license !== null &&
+      !Array.isArray(config.license)
+      ? config.license as Record<string, unknown>
+      : {}
+
+  const getString = (obj: Record<string, unknown>, key: string): string | undefined => {
+    const value = obj[key]
+    return typeof value === "string" ? value : undefined
+  }
+
+  return {
+    default: getString(nested, "default") ?? getString(config, "default"),
+    author: getString(nested, "author") ?? getString(config, "author"),
+    year: getString(nested, "year") ?? getString(config, "year"),
+    token: getString(nested, "token") ?? getString(config, "token"),
   }
 }
 
-const readConfig = async (): Promise<AppConfig> => {
+const configContext = createConfigContext<AppConfig>({ schema: ConfigSchema })
+const configCache = new Map<string, AppConfig | null>()
+
+const getConfigForPath = async (path: string): Promise<AppConfig | null> => {
+  const normalized = normalizeConfigPath(path)
+
+  if (configCache.has(normalized)) {
+    return configCache.get(normalized) ?? null
+  }
+
+  const loaded = await loadConfigFile(normalized)
+  const stored = loaded ?? null
+  configCache.set(normalized, stored)
+
+  return stored
+}
+
+const extractConfigPathFromArgs = (args: readonly string[]): string | undefined => {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+    if (arg === "--config") {
+      const next = args[i + 1]
+      if (next && !next.startsWith("-")) {
+        return next
+      }
+      continue
+    }
+
+    if (arg.startsWith("--config=")) {
+      return arg.slice("--config=".length)
+    }
+  }
+
+  return undefined
+}
+
+const loadConfigFile = async (path: string): Promise<AppConfig | undefined> => {
+  let text: string
   try {
-    const text = await Deno.readTextFile(CONFIG_PATH)
-    const parsed = parseToml(text) as Record<string, unknown>
-
-    const namespace =
-      typeof parsed.license === "object" &&
-        parsed.license !== null &&
-        !Array.isArray(parsed.license)
-        ? (parsed.license as Record<string, unknown>)
-        : {}
-
-    const getString = (obj: Record<string, unknown>, key: string): string | undefined => {
-      const value = obj[key]
-      return typeof value === "string" ? value : undefined
-    }
-
-    return {
-      default: getString(namespace, "default") ?? getString(parsed, "default"),
-      author: getString(namespace, "author") ?? getString(parsed, "author"),
-      year: getString(namespace, "year") ?? getString(parsed, "year") ?? CURRENT_YEAR,
-      token: getString(namespace, "token") ?? getString(parsed, "token"),
-    }
+    text = await Deno.readTextFile(path)
   } catch (error) {
     if (error instanceof Deno.errors.NotFound) {
-      return { year: CURRENT_YEAR }
+      return undefined
     }
 
     throw error
   }
+
+  const parsed = parseToml(text) as unknown
+  const result = v.safeParse(ConfigSchema, parsed)
+
+  if (!result.success) {
+    const firstIssue = result.issues[0]
+    const message = firstIssue ? `${firstIssue.path?.join(".") ?? ""}: ${firstIssue.message}` :
+      "Invalid configuration"
+    throw new Error(`Invalid config file (${path}): ${message}`)
+  }
+
+  return buildConfig(result.output)
 }
 
-const createKeyParser = (keys: readonly string[], strict: boolean) => {
+;(configContext as {
+  getAnnotations: (parsed?: unknown) => Promise<Record<symbol, unknown>>
+}).getAnnotations = async (parsed?: unknown) => {
+  const parsedConfigPath =
+    typeof parsed === "object" && parsed !== null && "config" in parsed
+      ? (parsed as { config?: string }).config
+      : undefined
+
+  const fallbackConfigPath = extractConfigPathFromArgs(Deno.args)
+  const configPath = normalizeConfigPath(
+    parsedConfigPath ?? fallbackConfigPath ?? `${CONFIG_DIR}/config.toml`,
+  )
+  const loaded = await getConfigForPath(configPath)
+
+  if (!loaded) {
+    return {} as Record<symbol, AppConfig>
+  }
+
+  setActiveConfig(configContext.id, loaded)
+  return { [configKey]: loaded } as Record<symbol, AppConfig>
+}
+
+const createKeyParser = (keys: readonly string[]) => {
   const normalized = [...new Set(keys)].sort()
 
   const description = normalized.length > 0
@@ -200,48 +272,58 @@ const createKeyParser = (keys: readonly string[], strict: boolean) => {
     }]
     : undefined
 
-  if (normalized.length === 0 || !strict) {
-    return optional(argument(string({ metavar: "KEY" }), description ? { description } : undefined))
-  }
-
   return optional(
-    argument(choice(normalized, { metavar: "KEY" }), {
-      description,
-    }),
+    argument(string({ metavar: "KEY" }), description ? { description } : undefined),
   )
 }
 
-const createBootstrapParser = (keys: readonly string[]) =>
+const createParser = (keys: readonly string[]) =>
   command(
     "add",
     object({
-      action: constant("add"),
-      key: createKeyParser(keys, false),
-      author: optional(option("-a", "--author", string({ metavar: "NAME" }))),
-      year: optional(option("-y", "--year", string({ metavar: "YEAR" }))),
-      token: optional(option("-t", "--token", string({ metavar: "TOKEN" }))),
+      config: optional(option("--config", string({ metavar: "PATH" }))),
+      key: bindConfig(createKeyParser(keys), {
+        context: configContext as any,
+        key: "default",
+        default: "",
+      }),
+      author: bindConfig(optional(option("-a", "--author", string({ metavar: "NAME" }))), {
+        context: configContext as any,
+        key: "author",
+        default: "",
+      }),
+      year: bindConfig(option("-y", "--year", string({ metavar: "YEAR" })), {
+        context: configContext as any,
+        key: "year",
+        default: CURRENT_YEAR,
+      }),
+      token: bindConfig(optional(option("-t", "--token", string({ metavar: "TOKEN" }))), {
+        context: configContext as any,
+        key: "token",
+        default: "",
+      }),
     }),
   )
 
-const createCliParser = (keys: readonly string[]) =>
-  command(
-    "add",
-    object({
-      action: constant("add"),
-      key: createKeyParser(keys, true),
-      author: optional(option("-a", "--author", string({ metavar: "NAME" }))),
-      year: optional(option("-y", "--year", string({ metavar: "YEAR" }))),
-      token: optional(option("-t", "--token", string({ metavar: "TOKEN" }))),
-    }),
-  )
-
-const getLicenseByKey = async (key: string): Promise<License> => {
+const getLicenseByKey = async (key: string, token?: string): Promise<License> => {
   const cached = await readCachedLicense(key)
   if (cached) {
     return cached
   }
 
-  throw new Error(`License \"${key}\" not found in cache. Run without network restrictions first to refresh cache.`)
+  try {
+    const fetched = await fetchLicense(key, token)
+    await writeCachedLicense(fetched)
+    return fetched
+  } catch (error) {
+    if (error instanceof Error) {
+      throw new Error(
+        `License \"${key}\" is not cached and could not be fetched. ${error.message}`,
+      )
+    }
+
+    throw error
+  }
 }
 
 const replaceAuthor = (author: string, key: string, text: string): string => {
@@ -321,43 +403,35 @@ const resolveYear = (rawYear?: string): string | undefined => {
 
 const main = async () => {
   await ensureDirs()
-  Deno.chdir(CONFIG_DIR)
 
-  const config = await readConfig()
+  const configPathArg = extractConfigPathFromArgs(Deno.args)
+  await getConfigForPath(configPathArg ?? CONFIG_PATH)
 
   const cachedKeys = await getCachedLicenseKeys()
+  const parser = createParser(cachedKeys)
 
-  const bootstrapArgs = run(createBootstrapParser(cachedKeys), {
+  const args = await runWith(parser, "license.ts", [configContext as SourceContext], {
     args: Deno.args,
-    help: "both",
-    programName: "license.ts",
+    help: {
+      mode: "both",
+      onShow: () => Deno.exit(0),
+    },
   })
 
-  const effectiveToken = bootstrapArgs.token ?? config.token
+  const token = args.token || undefined
 
-  await ensureCache(effectiveToken)
-  const refreshedKeys = await getCachedLicenseKeys()
-  const cliParser = createCliParser(refreshedKeys)
-
-  const args = run(cliParser, {
-    args: Deno.args,
-    help: "both",
-    programName: "license.ts",
-  })
-
-  const licenseKey = args.key ?? config.default
+  const licenseKey = args.key ?? ""
   if (!licenseKey) {
-    console.error(
+    throw new Error(
       "License key is required. Provide one as an argument or config default in ~/.config/license-add/config.toml",
     )
-    Deno.exit(1)
   }
 
-  const author = args.author ?? config.author
-  const year = resolveYear(args.year ?? config.year)
+  const license = await getLicenseByKey(licenseKey, token)
 
-  const license = await getLicenseByKey(licenseKey)
   let text = license.body
+  const year = resolveYear(args.year)
+  const author = args.author || undefined
 
   if (year) {
     text = replaceYear(year, license.key, text)
@@ -368,8 +442,19 @@ const main = async () => {
   }
 
   console.log(text)
+  clearActiveConfig(configContext.id)
 }
 
 if (import.meta.main) {
-  await main()
+  try {
+    await main()
+  } catch (error) {
+    clearActiveConfig(configContext.id)
+    if (error instanceof Error) {
+      console.error(error.message)
+    } else {
+      console.error(String(error))
+    }
+    Deno.exit(1)
+  }
 }
