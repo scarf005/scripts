@@ -1,6 +1,7 @@
 {
   "tasks": {
-    "dev": "deno run --watch main.ts"
+    "dev": "deno run --watch main.ts",
+    "mute-steam-notification-sounds": "deno run --allow-env --allow-read --allow-write mute-steam-notification-sounds.ts"
   },
   "fmt": {
     "semiColons": false,
