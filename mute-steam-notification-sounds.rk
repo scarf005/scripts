@@ -1,0 +1,163 @@
+#!/usr/bin/env -S renk script
+---
+[dependencies]
+clap = { version = "4.6.8", features = ["derive"] }
+---
+
+use clap.Parser
+use std.os.unix.fs.PermissionsExt
+use std.path.{Path, PathBuf}
+
+type Error = Box[dyn std.error.Error + Send + Sync]
+
+const DEFAULT_SOUND_NAMES: [&str; 3] = ["friend_online.wav", "friend_join.wav", "message.wav"]
+const BACKUP_DIR_NAME: &str = ".backup-sounds"
+const SAMPLE_RATE: u32 = 44_100
+const CHANNELS: u16 = 2
+const BYTES_PER_SAMPLE: u16 = 2
+const SILENT_FRAMES: u32 = 4_410
+
+/// Replace Steam friend notification sounds with silent WAV files
+///
+/// Backups are kept in friends/.backup-sounds/ and reused for restore.
+#[derive(Parser)]
+#[command(name = "mute-steam-notification-sounds")]
+struct Cli:
+    /// Steam directory (default: auto-detect native Steam)
+    #[arg(long, value_name = "path")]
+    steam_dir: Option[String]
+    /// Mute or restore every friends/*.wav file
+    #[arg(long)]
+    all: bool
+    /// Restore backed-up sound files
+    #[arg(long)]
+    restore: bool
+    /// Print actions without changing files
+    #[arg(long)]
+    dry_run: bool
+    /// Sound files (default: friend_online.wav friend_join.wav message.wav)
+    #[arg(value_name = "sound.wav")]
+    sound_names: Vec[String]
+
+fn home() -> PathBuf = std.env.var_os("HOME")
+    .map(PathBuf.from)
+    .unwrap_or_else(|| std.env.current_dir().unwrap_or_default())
+
+fn expand_home(path: &str) -> PathBuf = match path.strip_prefix("~"):
+    Some("") => home()
+    Some(rest) if rest.starts_with('/') => home().join(&rest[1..])
+    _ => PathBuf.from(path)
+
+fn discover_steam_dir(explicit: Option[&str]) -> PathBuf:
+    if let Some(dir) = explicit.filter(|dir| !dir.is_empty()):
+        return expand_home(dir)
+    let from_env = std.env.var("STEAM_DIR")
+        .ok()
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| expand_home(&dir))
+    let native = home().join(".local/share/Steam")
+    from_env
+        .into_iter()
+        .chain([native.clone(), home().join(".steam/steam")])
+        .find(|dir| dir.join("friends").exists())
+        .unwrap_or(native)
+
+fn all_sound_names(friends: &Path) -> std.io.Result[Vec[String]]:
+    let mut names = Vec.new()
+    for entry in std.fs.read_dir(friends)?:
+        let entry = entry?
+        let name = entry.file_name().to_string_lossy().into_owned()
+        if entry.file_type()?.is_file() && name.to_lowercase().ends_with(".wav"):
+            names.push(name)
+    names.sort()
+    Ok(names)
+
+fn selected_sound_names(cli: &Cli, friends: &Path) -> std.io.Result[Vec[String]]:
+    if cli.all:
+        return all_sound_names(friends)
+    if cli.sound_names.is_empty():
+        return Ok(DEFAULT_SOUND_NAMES.map(String.from).to_vec())
+    let mut seen = std.collections.HashSet.new()
+    Ok(cli
+        .sound_names
+        .iter()
+        .filter(|name| seen.insert(*name))
+        .cloned()
+        .collect())
+
+/// A 0.1 s silent 16-bit stereo PCM WAV file.
+fn silent_wav() -> Vec[u8]:
+    let block = CHANNELS * BYTES_PER_SAMPLE
+    let data_size = SILENT_FRAMES * block as u32
+    let mut wav = Vec.new()
+    wav.extend_from_slice(b"RIFF")
+    wav.extend_from_slice(&(36 + data_size).to_le_bytes())
+    wav.extend_from_slice(b"WAVEfmt ")
+    wav.extend_from_slice(&(16_u32).to_le_bytes())
+    wav.extend_from_slice(&(1_u16).to_le_bytes())
+    wav.extend_from_slice(&CHANNELS.to_le_bytes())
+    wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes())
+    wav.extend_from_slice(&(SAMPLE_RATE * block as u32).to_le_bytes())
+    wav.extend_from_slice(&block.to_le_bytes())
+    wav.extend_from_slice(&(BYTES_PER_SAMPLE * 8).to_le_bytes())
+    wav.extend_from_slice(b"data")
+    wav.extend_from_slice(&data_size.to_le_bytes())
+    wav.resize(44 + data_size as usize, 0)
+    wav
+
+fn mute(friends: &Path, backup_dir: &Path, name: &str, dry_run: bool) -> std.io.Result[()]:
+    let source = friends.join(name)
+    let backup = backup_dir.join(name)
+    if !source.exists():
+        println!("skip missing {source.display()}")
+        return Ok(())
+    if !dry_run:
+        std.fs.create_dir_all(backup_dir)?
+    if !backup.exists():
+        println!("backup {source.display()} -> {backup.display()}")
+        if !dry_run:
+            std.fs.copy(&source, &backup)?
+    println!("mute {source.display()}")
+    if !dry_run:
+        std.fs.write(&source, silent_wav())?
+        std.fs.set_permissions(&source, std.fs.Permissions.from_mode(0o644))?
+    Ok(())
+
+fn restore(friends: &Path, backup_dir: &Path, name: &str, dry_run: bool) -> std.io.Result[()]:
+    let target = friends.join(name)
+    let backup = backup_dir.join(name)
+    if !backup.exists():
+        println!("skip missing backup {backup.display()}")
+        return Ok(())
+    println!("restore {backup.display()} -> {target.display()}")
+    if !dry_run:
+        std.fs.copy(&backup, &target)?
+    Ok(())
+
+fn run(cli: Cli) -> Result[(), Error]:
+    let friends = discover_steam_dir(cli.steam_dir.as_deref()).join("friends")
+    let backup_dir = friends.join(BACKUP_DIR_NAME)
+    if !friends.exists():
+        return Err(format!(
+            "Steam friends sound directory not found: {}",
+            friends.display()
+        )
+        .into())
+    let names = selected_sound_names(&cli, &friends)?
+    if names.is_empty():
+        return Err("no sound files selected".into())
+    for name in &names:
+        if name.contains('/') || name.contains('\0'):
+            return Err(format!("invalid sound file name: {name}").into())
+        if cli.restore:
+            restore(&friends, &backup_dir, name, cli.dry_run)?
+        else:
+            mute(&friends, &backup_dir, name, cli.dry_run)?
+    if !cli.restore:
+        println!("restart Steam if a notification sound was already cached")
+    Ok(())
+
+fn main():
+    if let Err(err) = run(Cli.parse()):
+        eprintln!("error: {err}")
+        std.process.exit(1)
