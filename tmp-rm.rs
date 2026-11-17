@@ -20,12 +20,13 @@ rustix = { version = "=1.1.6", features = ["fs"] }
 //! - The installed program is a static binary: no cargo, PATH, config or loader takes part in a run.
 //!
 //! Outside this: a process that can already change the mounts, in this or another namespace, or write
-//! the binary can delete anything without this program. /tmp moved elsewhere during a run keeps losing what was under it at the start.
+//! the binary can delete anything without this program. A run keeps the /tmp it opened: if /tmp moves
+//! during a run, the run continues to remove under the old /tmp.
 //!
-//! Build, with the musl target of the nightly toolchain:
-//!   env -u RUSTC_WRAPPER cargo +nightly -Zscript build --release \
-//!     --target x86_64-unknown-linux-musl --target-dir ~/.cache/tmp-rm-build --manifest-path tmp-rm.rs
-//!   install -m 755 ~/.cache/tmp-rm-build/x86_64-unknown-linux-musl/release/tmp-rm ~/.local/bin/tmp-rm
+//! An entry that cannot go is reported, and the run continues with its siblings. `--dry-run` prints
+//! each entry that would go, contents before their directory.
+//!
+//! Build and install the static binary: `just tmp-rm`.
 //!
 //! Exit status: 0 all removed, 1 something was refused or failed, 2 bad usage or an unfit /tmp.
 
@@ -150,7 +151,7 @@ fn components(path: &OsStr) -> Result<Vec<CString>, String> {
     rest.split(|b| *b == b'/')
         .map(|part| match part {
             b"" | b"." | b".." => Err(format!(
-                "has the component {:?}",
+                "has the component '{}'",
                 String::from_utf8_lossy(part)
             )),
             _ => CString::new(part).map_err(|_| "holds a NUL".to_string()),
@@ -170,32 +171,64 @@ fn entries(dir: impl AsFd) -> Result<Vec<CString>, Errno> {
         .collect()
 }
 
-/// Removes `name` of `parent`, its contents first; counts what went in `removed`.
+#[derive(Default)]
+struct Tally {
+    removed: u64,
+    failed: u64,
+}
+
+/// Reports `e` for `path` and counts it; false.
+fn fail(tally: &mut Tally, path: &str, e: impl std::fmt::Display) -> bool {
+    say(&format!("tmp-rm: {path}: {e}"));
+    tally.failed += 1;
+    false
+}
+
+/// Removes `name` of `parent`, shown as `path`, its contents first. Reports each entry that stays and
+/// continues with the rest; false when something under `name` stayed.
 fn remove(
     parent: &OwnedFd,
     name: &CStr,
+    path: &str,
     depth: usize,
     dry_run: bool,
-    removed: &mut u64,
-) -> Result<(), String> {
-    let shown = |e: &dyn std::fmt::Display| format!("{}: {e}", name.to_string_lossy());
+    tally: &mut Tally,
+) -> bool {
     if depth > MAX_DEPTH {
-        return Err(shown(&"deeper than the limit"));
+        return fail(tally, path, "deeper than the limit");
     }
-    let stat = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|e| shown(&e))?;
-    if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
-        let dir = open_dir(parent, name).map_err(|e| shown(&e))?;
-        for child in entries(&dir).map_err(|e| shown(&e))? {
-            remove(&dir, &child, depth + 1, dry_run, removed).map_err(|e| shown(&e))?;
+    let stat = match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(e) => return fail(tally, path, e),
+    };
+    let flags = if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
+        let dir = match open_dir(parent, name) {
+            Ok(dir) => dir,
+            Err(e) => return fail(tally, path, e),
+        };
+        let children = match entries(&dir) {
+            Ok(children) => children,
+            Err(e) => return fail(tally, path, e),
+        };
+        let mut emptied = true;
+        for child in children {
+            let child_path = format!("{path}/{}", child.to_string_lossy());
+            emptied &= remove(&dir, &child, &child_path, depth + 1, dry_run, tally);
         }
-        if !dry_run {
-            unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(|e| shown(&e))?;
+        if !emptied {
+            return false;
         }
-    } else if !dry_run {
-        unlinkat(parent, name, AtFlags::empty()).map_err(|e| shown(&e))?;
+        AtFlags::REMOVEDIR
+    } else {
+        AtFlags::empty()
+    };
+    if dry_run {
+        let _ = writeln!(std::io::stdout(), "{}", escaped(path));
+    } else if let Err(e) = unlinkat(parent, name, flags) {
+        return fail(tally, path, e);
     }
-    *removed += 1;
-    Ok(())
+    tally.removed += 1;
+    true
 }
 
 /// The directory `name` of `parent`, which may be the root of one of `mounts`.
@@ -215,12 +248,13 @@ fn open_parent(parent: impl AsFd, name: &CStr, mounts: &[u64]) -> Result<OwnedFd
     Ok(fd)
 }
 
+/// Removes `path`; the error when its parents cannot be opened.
 fn remove_path(
     tmp: &OwnedFd,
     mounts: &[u64],
     path: &OsStr,
     dry_run: bool,
-    removed: &mut u64,
+    tally: &mut Tally,
 ) -> Result<(), String> {
     let parts = components(path)?;
     let (last, parents) = parts.split_last().expect("at least one component");
@@ -228,12 +262,34 @@ fn remove_path(
     for part in parents {
         parent = open_parent(&parent, part, mounts)?;
     }
-    remove(&parent, last, 0, dry_run, removed)
+    let shown = path.to_string_lossy();
+    remove(
+        &parent,
+        last,
+        shown.strip_suffix('/').unwrap_or(&shown),
+        0,
+        dry_run,
+        tally,
+    );
+    Ok(())
 }
 
-/// `text` on stderr, its control characters escaped; a stderr that takes nothing changes nothing.
+/// `text` with its control characters escaped.
+fn escaped(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
+/// `text` on stderr, escaped; a stderr that takes nothing changes nothing.
 fn say(text: &str) {
-    let _ = writeln!(std::io::stderr(), "{}", text.escape_debug());
+    let _ = writeln!(std::io::stderr(), "{}", escaped(text));
 }
 
 fn main() -> ExitCode {
@@ -262,26 +318,34 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let mut removed = 0;
-    let mut failed = 0;
+    let mut tally = Tally::default();
     for path in &paths {
-        if let Err(e) = remove_path(&tmp, &mounts, path, dry_run, &mut removed) {
-            say(&format!("tmp-rm: {}: {e}", path.to_string_lossy()));
-            failed += 1;
+        if let Err(e) = remove_path(&tmp, &mounts, path, dry_run, &mut tally) {
+            fail(&mut tally, &path.to_string_lossy(), e);
         }
     }
     let verb = if dry_run { "would remove" } else { "removed" };
     let _ = writeln!(
         std::io::stdout(),
-        "{verb} {removed} entries from {} paths, {failed} failed",
-        paths.len()
+        "{verb} {} entries from {} paths, {} failed",
+        tally.removed,
+        paths.len(),
+        tally.failed
     );
-    if failed == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+    if tally.failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::check_mount;
+    use super::{Tally, check_mount, components, remove};
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
 
     /// /tmp as a Claude Code bubblewrap sandbox shows it: one tmpfs at /tmp twice and under it.
     const SANDBOX: &str = "\
@@ -309,5 +373,105 @@ mod tests {
     fn refuses_a_sibling_path_that_only_starts_with_tmp() {
         let table = format!("{SANDBOX}1801 1 0:51 / /tmpx rw - tmpfs tmpfs rw\n");
         assert!(check_mount(&table, 1584).is_err());
+    }
+
+    /// Refuses /tmp as an ext4, at another mount point, or as a subdirectory of its tmpfs.
+    #[test]
+    fn refuses_tmp_that_is_not_the_root_of_a_tmpfs_at_tmp() {
+        for (line, error) in [
+            (
+                "9 1 8:1 / /tmp rw - ext4 /dev/sda1 rw",
+                "/tmp is a ext4, not a tmpfs",
+            ),
+            (
+                "9 1 0:51 / /var/tmp rw - tmpfs tmpfs rw",
+                "the mount of /tmp names /var/tmp",
+            ),
+            (
+                "9 1 0:51 /sub /tmp rw - tmpfs tmpfs rw",
+                "/tmp shows /sub of its tmpfs, not its root",
+            ),
+        ] {
+            assert_eq!(check_mount(line, 9), Err(error.into()));
+        }
+    }
+
+    /// Takes the components after /tmp; one trailing slash is allowed.
+    #[test]
+    fn splits_a_path_under_tmp() {
+        let parts = components(OsStr::new("/tmp/a/b/")).unwrap();
+        assert_eq!(parts, [c"a".to_owned(), c"b".to_owned()]);
+    }
+
+    /// Refuses /tmp itself, other roots, and empty, `.` or `..` components: `/tmp/a/../b` is refused.
+    #[test]
+    fn refuses_paths_that_are_not_plain_names_under_tmp() {
+        for path in [
+            "/tmp",
+            "/tmp/",
+            "/tmpx/a",
+            "tmp/a",
+            "/tmp//a",
+            "/tmp/a//",
+            "/tmp/./a",
+            "/tmp/a/../b",
+        ] {
+            assert!(components(OsStr::new(path)).is_err(), "{path}");
+        }
+    }
+
+    /// An empty directory under the temp directory, unique to `name`.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tmp-rm-test-{}-{name}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn remove_in(dir: &PathBuf, name: &str, dry_run: bool, tally: &mut Tally) -> bool {
+        let parent = rustix::fs::open(
+            dir,
+            rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        let name = std::ffi::CString::new(name).unwrap();
+        remove(&parent, &name, "t", 0, dry_run, tally)
+    }
+
+    /// In t/{locked/f, a, b} with locked unreadable, removes a and b, keeps t and locked, counts 1 failure.
+    #[test]
+    fn continues_with_siblings_after_a_failing_entry() {
+        let dir = scratch("siblings");
+        let t = dir.join("t");
+        fs::create_dir_all(t.join("locked")).unwrap();
+        fs::write(t.join("locked/f"), "").unwrap();
+        fs::write(t.join("a"), "").unwrap();
+        fs::write(t.join("b"), "").unwrap();
+        fs::set_permissions(t.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        let mut tally = Tally::default();
+        let emptied = remove_in(&dir, "t", false, &mut tally);
+        fs::set_permissions(t.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+        let left: Vec<_> = fs::read_dir(&t)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(!emptied);
+        assert_eq!(left, ["locked"]);
+        assert_eq!((tally.removed, tally.failed), (2, 1));
+    }
+
+    /// A dry run over t/{d/f} counts 3 entries and leaves all of them.
+    #[test]
+    fn dry_run_counts_and_keeps_every_entry() {
+        let dir = scratch("dry");
+        fs::create_dir_all(dir.join("t/d")).unwrap();
+        fs::write(dir.join("t/d/f"), "").unwrap();
+        let mut tally = Tally::default();
+        let emptied = remove_in(&dir, "t", true, &mut tally);
+        let kept = dir.join("t/d/f").exists();
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(emptied && kept);
+        assert_eq!((tally.removed, tally.failed), (3, 0));
     }
 }
