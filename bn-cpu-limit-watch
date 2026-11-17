@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# Keeps total CPU use at or below 90% of all CPUs while the screen is unlocked; lifts the cap while locked. Agent and
+# background work (bnwork.slice, pueued.service) gets whatever the desktop and its apps leave of that 90%: every tick
+# the quota is the 90% budget minus what everything else used during the last tick. Coding agents started in a
+# terminal are moved into bnwork.slice, and the processes they start inherit it.
+set -u
+cpus=$(getconf _NPROCESSORS_ONLN)
+total=$((cpus * 90))
+floor=100        # never starve the work completely (percent of one CPU)
+pueue_share=200  # while pueued is outside bnwork.slice it takes this share of the work quota
+tick=5
+locked=false
+cg=/sys/fs/cgroup/user.slice/user-$UID.slice/user@$UID.service
+last_cap=""
+
+in_bnwork() { grep -q '/bnwork.slice/' "/proc/$1/cgroup" 2>/dev/null; }
+pueue_in_bnwork() { in_bnwork "$(systemctl --user show -p MainPID --value pueued.service)"; }
+
+# Busy CPU time of the whole system and of the work cgroups, in microseconds.
+busy_usec() { awk '/^cpu /{print ($2+$3+$4+$7+$8+$9) * 1000000 / '"$(getconf CLK_TCK)"'}' /proc/stat; }
+work_usec() {
+    local sum=0 f
+    for f in "$cg/bnwork.slice/cpu.stat" "$cg/app.slice/pueued.service/cpu.stat"; do
+        [ -r "$f" ] && sum=$((sum + $(awk '/^usage_usec/{print $2}' "$f")))
+    done
+    echo "$sum"
+}
+
+set_caps() {
+    local cap=$1 work_cap="" pueue_cap=""
+    if [ -n "$cap" ]; then
+        work_cap="$cap%"
+        if ! pueue_in_bnwork; then
+            pueue_cap="$((cap * pueue_share / (pueue_share + total)))%"
+            work_cap="$((cap - ${pueue_cap%\%}))%"
+        fi
+    fi
+    [ "$work_cap/$pueue_cap" = "$last_cap" ] && return
+    last_cap="$work_cap/$pueue_cap"
+    systemctl --user set-property --runtime bnwork.slice CPUWeight=20 "CPUQuota=$work_cap"
+    systemctl --user set-property --runtime pueued.service CPUWeight=20 "CPUQuota=$pueue_cap"
+}
+
+adopt_agents() {
+    local pid
+    for pid in $(pgrep -u "$UID" -x 'claude|pi|codex|gemini|opencode'); do
+        in_bnwork "$pid" && continue
+        busctl --user call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager \
+            StartTransientUnit 'ssa(sv)a(sa(sv))' "agent-$pid.scope" fail 2 PIDs au 1 "$pid" Slice s bnwork.slice 0 \
+            >/dev/null 2>&1
+    done
+}
+
+active=$(gdbus call --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver \
+    --method org.freedesktop.ScreenSaver.GetActive)
+[[ $active == *true* ]] && locked=true
+prev_busy=$(busy_usec) prev_work=$(work_usec) prev_t=$(date +%s%N)
+dbus-monitor --session "type='signal',interface='org.freedesktop.ScreenSaver',member='ActiveChanged'" |
+    while true; do
+        if read -r -t "$tick" line; then
+            case $line in
+                *"boolean true"*) locked=true ;;
+                *"boolean false"*) locked=false ;;
+            esac
+        fi
+        busy=$(busy_usec) work=$(work_usec) t=$(date +%s%N)
+        elapsed=$(((t - prev_t) / 1000))
+        if [ "$elapsed" -gt 0 ]; then
+            other=$(((busy - prev_busy - (work - prev_work)) * 100 / elapsed))
+            [ "$other" -lt 0 ] && other=0
+            cap=$((total - other))
+            [ "$cap" -lt "$floor" ] && cap=$floor
+            # Round down to half CPUs to avoid resetting the quota on every small change.
+            cap=$((cap / 50 * 50))
+            [ "$cap" -lt "$floor" ] && cap=$floor
+            if [ "$locked" = true ]; then set_caps ""; else set_caps "$cap"; fi
+        fi
+        prev_busy=$busy prev_work=$work prev_t=$t
+        adopt_agents
+    done

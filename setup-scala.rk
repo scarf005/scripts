@@ -1,0 +1,77 @@
+#!/usr/bin/env -S renk script
+---
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+---
+
+use clap::{Parser, Subcommand}
+use std::io::Write
+use std::process::{Child, Command}
+
+const SCALAFMT_CONF: &str = r#"version = "3.9.3"
+runner.dialect = scala3
+indent.main = 4
+maxColumn = 100
+
+rewrite.trailingCommas.style = "always"
+rewrite.scala3.removeOptionalBraces = true
+binPack.parentConstructors = Oneline
+"#
+
+const PROJECT_SCALA: &str = r#"//> using option -feature -deprecation
+//> using options -experimental -language:experimental.betterFors
+
+//> using toolkit 0.7.0
+"#
+
+const GITIGNORE: &str = r#"/.bsp/
+/.scala-build/
+/.metals/
+"#
+
+/// setup scala project with defaults preferred by @scala005
+#[derive(Parser)]
+#[command(bin_name = "COMMAND")]
+struct Cli:
+    #[command(subcommand)]
+    command: Option[Cmd]
+
+#[derive(Subcommand)]
+enum Cmd:
+    /// installs this script to ~/.local/bin
+    Install
+
+fn green(text: &str) -> String = if std.env.var_os("NO_COLOR").is_some() then text.to_string() else format!("\x1b[32m{text}\x1b[39m")
+
+fn spawn(program: &str, args: &[&str]) -> Option[Child] = Command.new(program).args(args).spawn().ok()
+
+fn create_new(path: &str, content: &str) -> std.io.Result[()]:
+    let mut file = std.fs.OpenOptions.new().write(true).create_new(true).open(path)?
+    file.write_all(content.as_bytes())
+
+fn setup():
+    let children = [
+        spawn("scala", &["setup-ide", "."]),
+        spawn("scala", &["--power", "default-file", "--write", ".github/workflows/ci.yml"]),
+        spawn("git", &["init"]),
+    ]
+    let _ = create_new(".gitignore", GITIGNORE)
+    let _ = create_new(".scalafmt.conf", SCALAFMT_CONF)
+    let _ = create_new("project.scala", PROJECT_SCALA)
+    for mut child in children.into_iter().flatten():
+        let _ = child.wait()
+    let message = green("setup complete")
+    println!("{message}")
+
+fn install():
+    let script = std.env.var("RUSK_SCRIPT").unwrap()
+    let dest = std.path.Path.new(&std.env.var("HOME").unwrap()).join(".local/bin/setup-scala.rk")
+    if std.fs.canonicalize(&script).ok() != std.fs.canonicalize(&dest).ok():
+        std.fs.copy(&script, &dest).unwrap()
+    let message = format!("installed to {dest.display()}")
+    println!("{green(&message)}")
+
+fn main():
+    match Cli.parse().command:
+        Some(Cmd.Install) => install()
+        None => setup()

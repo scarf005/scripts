@@ -1,0 +1,133 @@
+#!/usr/bin/env -S renk script
+---
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+icu_collator = "2"
+icu_locale = "2"
+regex = "1"
+serde_json = "1"
+tempfile = "3"
+---
+
+use std::collections::BTreeMap
+use std::io::Read
+use std::process::{Command, Stdio}
+
+use clap::Parser
+use icu_collator::{Collator, CollatorBorrowed}
+use icu_collator::options::CollatorOptions
+use icu_locale::Locale
+
+type Error = Box[dyn std.error.Error]
+
+/// Dump repo content to markdown. Requires 'gh' CLI and 'git'.
+#[derive(Parser)]
+#[command(name = "gitingest", bin_name = "gitingest", version = "0.1.0")]
+struct Cli:
+    source: Option[String]
+
+#[derive(Default)]
+struct Node:
+    children: BTreeMap[String, Node]
+
+fn is_binary(path: &str) -> bool:
+    let mut buffer = [0u8; 8000]
+    let read = std.fs.File.open(path).and_then(|mut file| file.read(&mut buffer))
+    match read:
+        Ok(len) => buffer[..len].contains(&0)
+        Err(_) => true
+
+fn run_text(program: &str, args: &[&str]) -> Result[String, Error]:
+    let output = Command.new(program).args(args).stderr(Stdio.null()).output()?
+    match output.status.code():
+        Some(0) => Ok(String.from_utf8(output.stdout)?)
+        Some(code) => Err(format!("Exited with code: {code}").into())
+        None => Err("Exited with signal".into())
+
+fn get_repo_name() -> String:
+    let from_gh = || -> Option[String]:
+        let output = Command.new("gh").args(["repo", "view", "--json", "name"]).stderr(Stdio.inherit()).output().ok()?
+        if !output.status.success():
+            return None
+        let json = serde_json::from_slice[serde_json::Value](&output.stdout).ok()?
+        json["name"].as_str().map(String.from)
+    let cwd_name = || std.env.current_dir().ok().and_then(|dir| dir.to_string_lossy().rsplit(['/', '\\']).next().map(String.from)).filter(|name| !name.is_empty())
+    from_gh().or_else(cwd_name).unwrap_or_else(|| "unknown-repo".to_string())
+
+fn get_tree(files: &[&str]) -> String:
+    let mut root = Node.default()
+    for path in files:
+        let mut current = &mut root
+        for part in path.split('/'):
+            current = current.children.entry(part.to_string()).or_default()
+    let locale = std.env.var("LC_ALL").or_else(|_| std.env.var("LANG")).ok()
+        .and_then(|raw| raw.split(['.', '@']).next().unwrap_or("").replace('_', "-").parse[Locale]().ok())
+        .unwrap_or(Locale.UNKNOWN)
+    let collator = Collator.try_new((&locale).into(), CollatorOptions.default()).unwrap()
+    let mut lines = vec![".".to_string()]
+    render(&root, "", &collator, &mut lines)
+    lines.join("\n")
+
+fn render(node: &Node, prefix: &str, collator: &CollatorBorrowed, lines: &mut Vec[String]):
+    let mut entries = node.children.iter().collect[Vec[_]]()
+    entries.sort_by(|(a, a_node), (b, b_node)|:
+        let a_dir = !a_node.children.is_empty()
+        let b_dir = !b_node.children.is_empty()
+        b_dir.cmp(&a_dir).then_with(|| collator.compare(a, b))
+    )
+    for (i, (key, child)) in entries.iter().enumerate():
+        let is_last = i == entries.len() - 1
+        let connector = if is_last then "└── " else "├── "
+        lines.push(format!("{prefix}{connector}{key}"))
+        if !child.children.is_empty():
+            let indent = if is_last then "    " else "│   "
+            let child_prefix = format!("{prefix}{indent}")
+            render(child, &child_prefix, collator, lines)
+
+fn ingest(source: Option[&str], temp_dir: &mut Option[tempfile.TempDir]) -> Result[String, Error]:
+    if let Some(source) = source:
+        let remote = regex::Regex.new(r"^https?://|^git@|^[A-Za-z0-9_-]+/[A-Za-z0-9_-]+$").unwrap()
+        let target = if remote.is_match(source):
+            let dir = tempfile::tempdir()?
+            let path = dir.path().to_string_lossy().into_owned()
+            *temp_dir = Some(dir)
+            run_text("gh", &["repo", "clone", source, &path, "--", "--depth", "1"])?
+            path
+        else:
+            source.to_string()
+        std.env.set_current_dir(&target).map_err(|err| format!("{err}: chdir '{target}'"))?
+
+    let repo_name = get_repo_name()
+    let listing = run_text("git", &["ls-files"])?
+    let file_list = listing.split('\n').filter(|file| !file.is_empty()).collect[Vec[_]]()
+
+    let readme_pattern = regex::Regex.new(r"(?i)^readme(\.md|\.txt)?$").unwrap()
+    let readme_content = match file_list.iter().find(|file| readme_pattern.is_match(file)):
+        Some(file) => std.fs.read_to_string(file)?
+        None => String.new()
+
+    let mut parts = vec![format!("# {repo_name}"), String.new(), readme_content, String.new(), "## structure".to_string(), String.new(), get_tree(&file_list), String.new(), "## files".to_string(), String.new()]
+
+    for file in &file_list:
+        if is_binary(file):
+            continue
+        let content = std.fs.read_to_string(file)?
+        let ext = if file.contains('.') then file.rsplit('.').next().unwrap_or("") else ""
+        parts.push(format!("### {file}"))
+        parts.push(String.new())
+        parts.push(format!("```{ext}"))
+        parts.push(content)
+        parts.push("```".to_string())
+        parts.push(String.new())
+    Ok(parts.join("\n"))
+
+fn main():
+    let cli = Cli.parse()
+    let mut temp_dir = None
+    match ingest(cli.source.as_deref(), &mut temp_dir):
+        Ok(output) => println!("{output}")
+        Err(err) =>:
+            eprintln!("Error: {err}")
+            std.env.set_current_dir("/").ok()
+            drop(temp_dir)
+            std.process.exit(1)

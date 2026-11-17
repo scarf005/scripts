@@ -1,0 +1,17 @@
+#!/usr/bin/env -S renk script
+
+fn main():
+    let args = std.env.args().skip(1).collect[Vec[String]]()
+    let [action, date, rest @ ..] = args.as_slice() else:
+        eprintln!("Error: missing <action> <date>")
+        std.process.exit(1)
+    let joined = rest.join(" ")
+    eprintln!("> git {action} {joined}")
+    let status = std.process.Command.new("git")
+        .arg(action)
+        .args(rest)
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_DATE", date)
+        .status()
+        .unwrap()
+    std.process.exit(status.code().unwrap_or(1))

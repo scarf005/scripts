@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [ "$#" -lt 2 ]; then
+  echo "usage: assisted-by <model-name> <agent-name> [tool ...]" >&2
+  exit 1
+fi
+
+model_raw="$(printf '%s' "$1" | sed -E "s/^[[:space:]]+//; s/[[:space:]]+$//; s/^(['\"])(.*)\\1$/\\2/")"
+agent_raw="$(printf '%s' "$2" | sed -E "s/^[[:space:]]+//; s/[[:space:]]+$//; s/^(['\"])(.*)\\1$/\\2/")"
+shift 2
+
+tools=()
+
+for tool in "$@"; do
+  tool_raw="$(printf '%s' "$tool" | sed -E "s/^[[:space:]]+//; s/[[:space:]]+$//; s/^(['\"])(.*)\\1$/\\2/")"
+  [ -n "$tool_raw" ] && tools+=("$tool_raw")
+done
+
+model="$(printf '%s' "$model_raw" | tr '[:upper:]' '[:lower:]')"
+
+co_author=""
+
+case "$model" in
+  gpt-*|o*|codex*|chatgpt*|openai/*)
+    co_author="chatgpt-codex-connector[bot] <199175422+chatgpt-codex-connector[bot]@users.noreply.github.com>"
+    ;;
+  gemini*|google/gemini*)
+    co_author="gemini-code-assist[bot] <176961590+gemini-code-assist[bot]@users.noreply.github.com>"
+    ;;
+esac
+
+if [[ -z "$co_author" && "$model" =~ ^claude-([0-9]+\.?[0-9]*)-(opus|sonnet|haiku)$ ]]; then
+  version="${BASH_REMATCH[1]}"
+  family="${BASH_REMATCH[2]}"
+  family_title="${family^}"
+  co_author="Claude ${family_title} ${version} <noreply@anthropic.com>"
+fi
+
+if [[ -z "$co_author" && "$model" =~ ^claude-(opus|sonnet|haiku)-([0-9]+)-([0-9]+)$ ]]; then
+  family="${BASH_REMATCH[1]}"
+  major="${BASH_REMATCH[2]}"
+  minor="${BASH_REMATCH[3]}"
+  family_title="${family^}"
+  co_author="Claude ${family_title} ${major}.${minor} <noreply@anthropic.com>"
+fi
+
+if [[ -z "$co_author" && "$model" =~ ^claude-(opus|sonnet|haiku)$ ]]; then
+  family="${BASH_REMATCH[1]}"
+  family_title="${family^}"
+  co_author="Claude ${family_title} <noreply@anthropic.com>"
+fi
+
+printf '%s' "Assisted-by: ${agent_raw}:${model_raw}"
+
+if [ "${#tools[@]}" -gt 0 ]; then
+  printf ' %s' "${tools[@]}"
+fi
+
+printf '\n'
+
+if [ -n "$co_author" ]; then
+  printf '%s\n' "Co-authored-by: ${co_author}"
+fi

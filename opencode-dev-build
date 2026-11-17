@@ -1,0 +1,100 @@
+#!/usr/bin/env bun
+
+import fs from "fs"
+import path from "path"
+import { pathToFileURL } from "url"
+
+const home = process.env.HOME ?? "/home/scarf"
+const repo = process.env.OPENCODE_DEV_REPO ?? "/run/media/home/scarf/repo/etc/one-time-contribution/opencode"
+const dir = path.join(repo, "packages/opencode")
+const out = path.join(home, ".cache/opencode", "git")
+const solidPlugin = (await import(
+  pathToFileURL(path.join(dir, "node_modules/@opentui/solid/scripts/solid-plugin.ts")).href
+)).default
+
+process.chdir(dir)
+
+const rev = await Bun.$`git -C ${repo} rev-parse HEAD`.text().then((x) => x.trim())
+const short = rev.slice(0, 12)
+const version = `0.0.0-dev-${short}`
+
+const roots = await fs.promises.readdir(path.join(dir, "migration"), { withFileTypes: true })
+const names = roots
+  .filter((item) => item.isDirectory() && /^\d{14}/.test(item.name))
+  .map((item) => item.name)
+  .sort()
+
+const migrations = await Promise.all(
+  names.map(async (name) => {
+    const sql = await Bun.file(path.join(dir, "migration", name, "migration.sql")).text()
+    const match = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/.exec(name)
+    const timestamp = match
+      ? Date.UTC(
+          Number(match[1]),
+          Number(match[2]) - 1,
+          Number(match[3]),
+          Number(match[4]),
+          Number(match[5]),
+          Number(match[6]),
+        )
+      : 0
+    return { sql, timestamp, name }
+  }),
+)
+
+const local = path.resolve(dir, "node_modules/@opentui/core/parser.worker.js")
+const root = path.resolve(dir, "../../node_modules/@opentui/core/parser.worker.js")
+const parser = fs.realpathSync(fs.existsSync(local) ? local : root)
+const worker = path.resolve(dir, "src/cli/cmd/tui/worker.ts")
+const platform = process.platform === "win32" ? "win32" : process.platform
+const arch = process.arch
+const native = `@opentui/core-${platform}-${arch}`
+
+await fs.promises.rm(out, { recursive: true, force: true })
+await fs.promises.mkdir(path.join(out, "app"), { recursive: true })
+await fs.promises.symlink(path.join(dir, "node_modules"), path.join(out, "node_modules"), "dir")
+await Bun.write(
+  path.join(out, "package.json"),
+  JSON.stringify(
+    {
+      private: true,
+      type: "module",
+      dependencies: {
+        [native]: "0.1.87",
+      },
+    },
+    null,
+    2,
+  ),
+)
+await Bun.$`bun install`.cwd(out)
+
+const result = await Bun.build({
+  conditions: ["browser"],
+  tsconfig: "./tsconfig.json",
+  plugins: [solidPlugin],
+  target: "bun",
+  format: "esm",
+  outdir: path.join(out, "app"),
+  naming: "index.js",
+  entrypoints: ["./src/index.ts"],
+  define: {
+    OPENCODE_VERSION: `'${version}'`,
+    OPENCODE_MIGRATIONS: JSON.stringify(migrations),
+    OTUI_TREE_SITTER_WORKER_PATH: `'${parser.replaceAll("\\", "\\\\")}'`,
+    OPENCODE_WORKER_PATH: `'${worker.replaceAll("\\", "\\\\")}'`,
+    OPENCODE_CHANNEL: "'latest'",
+    OPENCODE_LIBC: process.platform === "linux" ? "'glibc'" : "",
+  },
+})
+
+if (!result.success) {
+  for (const log of result.logs) {
+    console.error(log.message)
+  }
+  process.exit(1)
+}
+
+await Bun.write(path.join(out, "rev.txt"), rev + "\n")
+await Bun.write(path.join(out, "repo.txt"), repo + "\n")
+console.log(`built ${version}`)

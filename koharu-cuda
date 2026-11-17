@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Koharu currently dlopens libcuda.so, but distrobox NVIDIA injection often
+# provides the runtime SONAME only: libcuda.so.1.
+KOHARU_CUDA_SHIM="$HOME/.local/lib/koharu-cuda"
+export LD_LIBRARY_PATH="$KOHARU_CUDA_SHIM${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# llama.cpp Vulkan enumerates your AMD iGPU as device 0 and NVIDIA as device 1.
+# Prefer the NVIDIA card to avoid AMD/iGPU Vulkan OOM crashes. Override manually
+# with e.g. GGML_VK_VISIBLE_DEVICES=0 koharu-cuda ... if needed.
+export GGML_VK_VISIBLE_DEVICES="${GGML_VK_VISIBLE_DEVICES:-1}"
+
+# Your GTX 1660 SUPER has limited VRAM. Let ggml-vulkan spill to host-visible
+# memory instead of aborting when a large LLM/OCR allocation does not fit.
+export GGML_VK_ALLOW_SYSMEM_FALLBACK="${GGML_VK_ALLOW_SYSMEM_FALLBACK:-1}"
+
+exec koharu "$@"

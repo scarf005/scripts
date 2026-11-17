@@ -1,0 +1,15 @@
+#!/bin/bash
+
+INTERFACE="wgcf-profile"
+
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m' # No Color
+
+if ip link show $INTERFACE > /dev/null 2>&1; then
+  echo -e "${YELLOW}Turning off $INTERFACE${NC}"
+  sudo wg-quick down $INTERFACE
+else
+  echo -e "${GREEN}Turning on $INTERFACE${NC}"
+  sudo wg-quick up $INTERFACE
+fi

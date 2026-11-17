@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+set -eu
+
+export WINEDEBUG=-all
+exec wine "$HOME/.local/opt/ShaderGlass/ShaderGlass.exe" "$@"

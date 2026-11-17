@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly repo="/home/scarf/repo/cata/Cataclysm-BN"
+readonly state_dir="$HOME/.local/state/cbn-main-build"
+readonly last_cpp_build_head_file="$state_dir/last-cpp-build-head"
+readonly lock_file="/tmp/cbn-main-build.lock"
+readonly notify_bin="$HOME/.local/bin/notify"
+
+export PATH="$HOME/.local/bin:$HOME/.local/share/deno/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+
+log() {
+  printf '[%s] %s\n' "$(date --iso-8601=seconds)" "$*"
+}
+
+notify() {
+  if [[ "${CBN_NOTIFY:-0}" == "1" && -x "$notify_bin" ]]; then
+    "$notify_bin" --id "$repo" "$1" "$2" || true
+  fi
+}
+
+on_error() {
+  local exit_code=$?
+  notify "BN main 자동 갱신 실패" "upstream/main pull 또는 linux-curses/linux-full 빌드가 실패했습니다. journalctl --user -u cbn-main-build.service를 확인하세요."
+  exit "$exit_code"
+}
+trap on_error ERR
+
+is_cpp_build_change() {
+  grep -E '(^|/)(CMakeLists\.txt|CMakePresets\.json)$|(^|/).*\.cmake$|\.(c|cc|cpp|cxx|h|hh|hpp|hxx|ipp|inl)$'
+}
+
+steam_game_is_exempt() {
+  local app_id="$1"
+  local process_text="$2"
+  local exempt_app_ids=",${CBN_STEAM_IDLE_EXEMPT_APPIDS:-3557620},"
+  local exempt_name_pattern="${CBN_STEAM_IDLE_EXEMPT_PATTERN:-Blue[ _-]?Archive}"
+
+  [[ -n "$app_id" && "$exempt_app_ids" == *",$app_id,"* ]] || [[ "$process_text" =~ $exempt_name_pattern ]]
+}
+
+active_steam_game_process() {
+  local pid comm args env app_id
+
+  while IFS= read -r -d '' proc_dir; do
+    [[ -r "$proc_dir/environ" ]] || continue
+    pid="${proc_dir##*/}"
+    env="$(tr '\0' '\n' <"$proc_dir/environ" 2>/dev/null || true)"
+    app_id="$(awk -F= '$1 == "SteamAppId" || $1 == "SteamGameId" { print $2; exit }' <<<"$env")"
+    [[ -n "$app_id" && "$app_id" != "0" && "$app_id" != "228980" ]] || continue
+
+    comm="$(<"$proc_dir/comm" 2>/dev/null || true)"
+    args="$(tr '\0' ' ' <"$proc_dir/cmdline" 2>/dev/null || true)"
+    if steam_game_is_exempt "$app_id" "$comm $args"; then
+      continue
+    fi
+
+    printf '%s appid=%s %s %s\n' "$pid" "$app_id" "$comm" "$args"
+    return 0
+  done < <(find /proc -maxdepth 1 -type d -name '[0-9]*' -print0 2>/dev/null)
+
+  while read -r pid comm args; do
+    [[ -n "$pid" ]] || continue
+    app_id="$(grep -oE 'steam_app_[0-9]+' <<<"$comm $args" | head -n 1 | grep -oE '[0-9]+' || true)"
+    [[ -n "$app_id" ]] || continue
+    if steam_game_is_exempt "$app_id" "$comm $args"; then
+      continue
+    fi
+
+    printf '%s appid=%s %s %s\n' "$pid" "$app_id" "$comm" "$args"
+    return 0
+  done < <(ps -eo pid=,comm=,args= | grep -Ei 'steam_app_[0-9]+' | grep -Ev 'cbn-main-build|grep' || true)
+}
+
+idle_status() {
+  if [[ "${CBN_IGNORE_IDLE:-0}" == "1" ]]; then
+    printf 'idle override enabled\n'
+    return 0
+  fi
+
+  local steam_game_process
+  steam_game_process="$(active_steam_game_process)"
+  if [[ -n "$steam_game_process" ]]; then
+    printf 'Steam game is running: %s\n' "$steam_game_process"
+    return 1
+  fi
+
+  printf 'no non-exempt Steam game is running\n'
+  return 0
+}
+
+active_cmake_build_process() {
+  pgrep -af 'cmake --build --preset (linux-curses|linux-full)|ninja-build.*out/build/(linux-curses|linux-full)' \
+    | grep -Ev 'cbn-main-build|grep' \
+    | head -n 1 || true
+}
+
+clean_merged_closed_worktrees() {
+  log "cleaning merged/closed worktrees targeting main"
+  if command -v gtr >/dev/null 2>&1; then
+    gtr clean --merged --closed --yes --force --to main
+  else
+    git gtr clean --merged --closed --yes --force --to main
+  fi
+}
+
+preset_artifact() {
+  case "$1" in
+    linux-curses) printf '%s/out/build/linux-curses/src/cataclysm-bn\n' "$repo" ;;
+    linux-full) printf '%s/out/build/linux-full/src/cataclysm-bn-tiles\n' "$repo" ;;
+    *) return 1 ;;
+  esac
+}
+
+preset_target() {
+  case "$1" in
+    linux-curses) printf 'cataclysm-bn\n' ;;
+    linux-full) printf 'cataclysm-bn-tiles\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+preset_build_dir() {
+  printf '%s/out/build/%s\n' "$repo" "$1"
+}
+
+preset_cache_file() {
+  printf '%s/CMakeCache.txt\n' "$(preset_build_dir "$1")"
+}
+
+cache_has_bool() {
+  local preset="$1"
+  local name="$2"
+  local value="$3"
+  local cache
+  cache="$(preset_cache_file "$preset")"
+
+  [[ -f "$cache" ]] && grep -qx "${name}:BOOL=${value}" "$cache"
+}
+
+preset_cache_ready() {
+  case "$1" in
+    linux-curses)
+      cache_has_bool linux-curses CURSES ON && cache_has_bool linux-curses TILES OFF
+      ;;
+    linux-full)
+      cache_has_bool linux-full CURSES OFF && cache_has_bool linux-full TILES ON && cache_has_bool linux-full SOUND ON
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+preset_ready() {
+  local artifact
+  artifact="$(preset_artifact "$1")"
+  [[ -x "$artifact" ]] && preset_cache_ready "$1"
+}
+
+configure_preset() {
+  local preset="$1"
+
+  log "configuring $preset from CMakePresets.json"
+  cmake --fresh --preset "$preset"
+}
+
+recompact_preset() {
+  local build_dir
+  build_dir="$(preset_build_dir "$1")"
+  [[ -f "$build_dir/build.ninja" ]] && ninja -C "$build_dir" -t recompact
+}
+
+build_preset_target() {
+  local preset="$1"
+  local target
+  target="$(preset_target "$preset")"
+
+  log "building $preset target $target"
+  cmake --build --preset "$preset" --target "$target" --parallel "${CBN_BUILD_JOBS:-$(nproc)}"
+  recompact_preset "$preset"
+}
+
+verify_preset() {
+  log "verifying $1 target is up to date"
+  build_preset_target "$1"
+}
+
+build_preset() {
+  local preset="$1"
+
+  configure_preset "$preset"
+  build_preset_target "$preset"
+  verify_preset "$preset"
+}
+
+exec 9>"$lock_file"
+if ! flock -n 9; then
+  log "another update/build is already running; skipping"
+  exit 0
+fi
+
+cd "$repo"
+mkdir -p "$state_dir"
+
+if [[ "$(git rev-parse --abbrev-ref HEAD)" != "main" ]]; then
+  log "not on main worktree; refusing to update"
+  exit 1
+fi
+
+if active_build="$(active_cmake_build_process)" && [[ -n "$active_build" ]]; then
+  log "another CMake build is already running; skipping auto update/build: $active_build"
+  exit 0
+fi
+
+old_head="$(git rev-parse HEAD)"
+base_head="$old_head"
+if [[ -f "$last_cpp_build_head_file" ]]; then
+  saved_head="$(<"$last_cpp_build_head_file")"
+  if git cat-file -e "${saved_head}^{commit}" 2>/dev/null && git merge-base --is-ancestor "$saved_head" "$old_head"; then
+    base_head="$saved_head"
+  else
+    log "stored C++ build head is unusable; using current HEAD as base"
+  fi
+fi
+
+log "fetching upstream/main"
+git fetch upstream main
+new_head="$(git rev-parse upstream/main)"
+local_commit_count="$(git rev-list --count "$new_head..$old_head")"
+
+mapfile -t changed_files < <(git diff --name-only --diff-filter=ACMRT "$base_head..$new_head")
+mapfile -t cpp_build_files < <(printf '%s\n' "${changed_files[@]}" | is_cpp_build_change || true)
+
+if (( local_commit_count > 0 )); then
+  log "rebasing $local_commit_count local main commit(s) onto upstream/main"
+  git pull --rebase upstream main
+elif [[ "$old_head" != "$new_head" ]] || ! git diff --quiet || ! git diff --cached --quiet; then
+  log "force-resetting main to upstream/main: $old_head -> $new_head"
+  git reset --hard "$new_head"
+else
+  log "main is current at $old_head; checking pending build state"
+fi
+clean_merged_closed_worktrees
+
+need_linux_curses=0
+need_linux_full=0
+build_reason=""
+if [[ "${CBN_FORCE_BUILD:-0}" == "1" ]]; then
+  need_linux_curses=1
+  need_linux_full=1
+  build_reason="forced build requested"
+elif [[ "${#cpp_build_files[@]}" -gt 0 ]]; then
+  need_linux_curses=1
+  need_linux_full=1
+  build_reason="C++/CMake changes detected: ${#cpp_build_files[@]} file(s)"
+fi
+
+if ! preset_ready linux-curses; then
+  need_linux_curses=1
+  build_reason+="${build_reason:+; }linux-curses artifact/cache is not ready: $(preset_artifact linux-curses)"
+fi
+if ! preset_ready linux-full; then
+  need_linux_full=1
+  build_reason+="${build_reason:+; }linux-full artifact/cache is not ready: $(preset_artifact linux-full)"
+fi
+
+if [[ "$need_linux_curses" == "0" && "$need_linux_full" == "0" ]]; then
+  if ! idle_reason="$(idle_status)"; then
+    log "readiness verification is pending, but PC is not idle: $idle_reason"
+    exit 0
+  fi
+
+  log "main is current at $new_head with no pending C++ changes; verifying preset targets"
+  verify_preset linux-full
+  verify_preset linux-curses
+  printf '%s\n' "$new_head" >"$last_cpp_build_head_file"
+  exit 0
+fi
+
+if ! idle_reason="$(idle_status)"; then
+  log "build is pending, but PC is not idle: $idle_reason"
+  exit 0
+fi
+log "PC is idle: $idle_reason"
+log "$build_reason"
+if [[ "${#cpp_build_files[@]}" -gt 0 ]]; then
+  printf '  %s\n' "${cpp_build_files[@]}"
+fi
+
+if [[ "$need_linux_full" == "1" ]]; then
+  build_preset linux-full
+fi
+
+if [[ "$need_linux_curses" == "1" ]]; then
+  build_preset linux-curses
+fi
+
+if ! preset_ready linux-curses || ! preset_ready linux-full; then
+  log "build completed but expected preset artifacts are missing"
+  exit 1
+fi
+
+printf '%s\n' "$(git rev-parse HEAD)" >"$last_cpp_build_head_file"
+
+log "build completed at $(git rev-parse --short HEAD)"
+notify "BN main 빌드 완료" "upstream/main $(git rev-parse --short HEAD)에서 필요한 linux-curses/linux-full 빌드를 완료했습니다."

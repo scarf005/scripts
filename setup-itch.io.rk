@@ -1,0 +1,129 @@
+#!/usr/bin/env -S renk script
+---
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+url = "2"
+---
+use std.io.{IsTerminal, Write}
+use std.process.{Command, Stdio}
+
+use clap.Parser
+use serde.Deserialize
+
+const SECRET: &str = "BUTLER_API_KEY"
+const USAGE: &str = "Usage: setup-itch.io [[HOST/]OWNER/REPO]"
+
+type Error = Box[dyn std.error.Error]
+
+#[derive(Parser)]
+#[command(disable_help_flag = true, disable_version_flag = true)]
+struct Cli:
+    #[arg(short, long)]
+    help: bool
+    repo: Option[String]
+
+#[derive(Deserialize)]
+struct Repo:
+    #[serde(rename = "nameWithOwner")]
+    name_with_owner: String
+    url: String
+
+#[derive(Deserialize, PartialEq)]
+struct PublicKey:
+    key: String
+    key_id: String
+
+fn gh(args: &[&str], input: &str) -> Result[String, Error]:
+    let mut child = Command.new("gh")
+        .args(args)
+        .env("GH_DEBUG", "")
+        .env_remove("LD_LIBRARY_PATH")
+        .env_remove("LD_PRELOAD")
+        .stdin(Stdio.piped())
+        .stdout(Stdio.piped())
+        .stderr(Stdio.piped())
+        .spawn()?
+    child.stdin.take().unwrap().write_all(input.as_bytes())?
+    let output = child.wait_with_output()?
+    if !output.status.success():
+        let stderr = String.from_utf8_lossy(&output.stderr).trim().to_string()
+        return Err(if stderr.is_empty() { "gh command failed".into() } else { stderr.into() })
+    Ok(String.from_utf8(output.stdout)?)
+
+fn public_key(args: &[&str]) -> Result[PublicKey, Error]:
+    let key = serde_json.from_str[PublicKey](&gh(args, "")?)?
+    if key.key.is_empty() || key.key_id.is_empty():
+        return Err("public key response is empty".into())
+    Ok(key)
+
+fn validate_token(token: &str) -> Result[String, Error]:
+    let token = token.trim()
+    if token.is_empty() || token.contains(char.is_whitespace):
+        return Err("API key must be a single non-empty token".into())
+    Ok(token.to_string())
+
+fn verify_token(token: &str) -> Result[(), Error]:
+    let response = ureq.get("https://api.itch.io/profile")
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+    match response:
+        Ok(response) =>:
+            let body: serde_json.Value = response.into_json()?
+            if body.get("user").is_none():
+                return Err(format!("itch.io rejected the API key: {body}").into())
+            println!("itch.io accepted the API key: {body}")
+            Ok(())
+        Err(ureq.Error.Status(code, response)) =>:
+            Err(format!("itch.io rejected the API key ({code}): {}", response.into_string()?.trim()).into())
+        Err(err) => Err(err.into())
+
+fn read_secret() -> Result[String, Error]:
+    if !std.io.stdin().is_terminal():
+        return Err("A terminal is required for hidden API key input".into())
+    Ok(rpassword.prompt_password("? Paste your itch.io API key ")?)
+
+fn setup(cli: Cli) -> Result[(), Error]:
+    if cli.help:
+        println!("{USAGE}")
+        println!("Set {SECRET} for the current or specified repository using gh api.")
+        return Ok(())
+    let repo_args = cli.repo.iter().map(String.as_str).collect[Vec[_]]()
+    let view_args = [&["repo", "view"][..], &repo_args, &["--json", "nameWithOwner,url"]].concat()
+    let repo = serde_json.from_str[Repo](&gh(&view_args, "")?)?
+    if !regex.Regex.new(r"^[^/\s]+/[^/\s]+$").unwrap().is_match(&repo.name_with_owner):
+        return Err("Invalid repository name".into())
+    let host = url.Url.parse(&repo.url)?.host_str().unwrap_or("").to_string()
+    let name = repo.name_with_owner
+    let endpoint = format!("repos/{name}/actions/secrets")
+    let key_path = format!("{endpoint}/public-key")
+    let key_args = ["api", "--hostname", &host, &key_path]
+    let key = public_key(&key_args)?
+    println!("Set {SECRET} for {host}/{name} (replaces any existing value).")
+    println!("Get an itch.io API key at https://itch.io/user/settings/api-keys")
+    let token = validate_token(&read_secret()?)?
+    verify_token(&token)?
+
+    // Let gh perform sealed-box encryption without storing the secret.
+    let target = format!("{host}/{name}")
+    let encrypted = gh(&["secret", "set", SECRET, "--repo", &target, "--no-store"], &token)?.trim().to_string()
+    if !regex.Regex.new(r"^[A-Za-z0-9+/]+={0,2}$").unwrap().is_match(&encrypted):
+        return Err("gh did not return a valid encrypted secret".into())
+    // gh fetches its own key: refuse to PUT if it rotated during encryption.
+    if key != public_key(&key_args)?:
+        return Err("Repository public key changed during setup; please retry".into())
+    let put_path = format!("{endpoint}/{SECRET}")
+    let body = serde_json::json!({ "encrypted_value": encrypted, "key_id": key.key_id }).to_string()
+    gh(&["api", "--hostname", &host, "--method", "PUT", &put_path, "--input", "-", "--silent"], &body)?
+    println!("Saved {SECRET} for {host}/{name}.")
+    Ok(())
+
+fn main():
+    let result = Cli.try_parse().map_err(|_| USAGE.into()).and_then(setup)
+    if let Err(err) = result:
+        eprintln!("Error: {err}")
+        std.process.exit(1)

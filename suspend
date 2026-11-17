@@ -1,0 +1,2 @@
+distrobox-host-exec systemctl suspend
+systemctl suspend

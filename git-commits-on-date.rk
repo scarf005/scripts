@@ -1,0 +1,657 @@
+#!/usr/bin/env -S renk script
+---
+[dependencies]
+chrono = "0.4"
+icu_collator = "2"
+icu_locale = "2"
+indexmap = "2"
+rayon = "1"
+regex = "1"
+serde_json = "1"
+terminal_size = "0.4"
+---
+
+use std.collections.BTreeSet
+use std.io.IsTerminal
+use std.path.Path
+use std.process.Command
+use std.sync.LazyLock
+
+use chrono.{DateTime, NaiveDate, SecondsFormat}
+use icu_collator.{CollatorBorrowed, options.CollatorOptions}
+use indexmap.IndexMap
+use rayon.prelude.*
+use regex.Regex
+use serde_json.Value
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum DateField:
+    Author
+    Committer
+    Either
+
+impl DateField:
+    fn name(self) -> &'static str = match self:
+        DateField.Author => "author"
+        DateField.Committer => "committer"
+        DateField.Either => "either"
+
+#[derive(Clone, Copy, PartialEq)]
+enum ColorMode:
+    Auto
+    Always
+    Never
+
+struct Options:
+    date_input: String
+    root: String
+    date_field: DateField
+    color: ColorMode
+    verbose: bool
+    use_cache: bool
+
+#[derive(Debug)]
+struct DateWindow:
+    label: String
+    start: i64
+    end: i64
+
+#[derive(Clone)]
+struct Worktree:
+    path: String
+    head: String
+    branch: Option[String]
+    primary: bool
+
+struct Commit:
+    hash: String
+    author_date: String
+    committer_date: String
+    author_name: String
+    author_email: String
+    subject: String
+
+struct Row:
+    repository: String
+    role: String
+    branch: String
+    worktree: String
+    commit: String
+    date: String
+    author: String
+    subject: String
+
+struct GitResult:
+    success: bool
+    stdout: String
+    stderr: String
+
+static HOME: LazyLock[String] = LazyLock.new(|| std.env.var("HOME").unwrap_or_else(|_| "/home/scarf".to_string()))
+static DEFAULT_ROOT: LazyLock[String] = LazyLock.new(|| format!("{}/repo", *HOME))
+const AUTHOR_PATTERN: &str = "[sS][cC][aA][rR][fF]"
+const SKIPPED_DIRS: [&str; 10] = [
+    ".git",
+    ".cache",
+    ".direnv",
+    ".idea",
+    ".venv",
+    "build",
+    "dist",
+    "node_modules",
+    "target",
+    "vendor",
+]
+
+mod ansi:
+    pub const RESET: &str = "\x1b[0m"
+    pub const BOLD: &str = "\x1b[1m"
+    pub const DIM: &str = "\x1b[2m"
+    pub const GREEN: &str = "\x1b[32m"
+    pub const YELLOW: &str = "\x1b[33m"
+    pub const CYAN: &str = "\x1b[36m"
+
+const USAGE: &str = "Usage: git-commits-on-date.rk DATE [options]
+
+Find commits in local repositories below drydock's configured roots for an ISO 8601 calendar date.
+
+DATE                         2026-08-10 or 2026-08-10T00:00:00+09:00
+--root PATH                  repository search root (default: ~/repo)
+--date-field FIELD           author, committer, or either (default: author)
+--color MODE                 auto, always, or never (default: auto)
+--verbose                    show skipped repositories and scan progress
+--no-cache                   ignore drydock's cache and scan the filesystem
+-h, --help                   show this help
+
+Examples:
+  git-commits-on-date.rk 2026-08-10
+  git-commits-on-date.rk 2026-08-10 --date-field=committer --color=always
+"
+
+// TextDecoder drops a leading byte order mark and replaces invalid UTF-8.
+fn decode(bytes: &[u8]) -> String:
+    let text = String.from_utf8_lossy(bytes)
+    text.strip_prefix('\u{feff}').unwrap_or(&text).to_string()
+
+fn run_git(cwd: &str, args: &[&str]) -> GitResult:
+    let failure = |stderr: String| GitResult{ success: false, stdout: String.new(), stderr }
+    if !Path.new(cwd).exists():
+        return failure(format!("Failed to spawn '/usr/bin/git': No such cwd '{cwd}'"))
+    let output = Command.new("/usr/bin/git")
+        .args(args)
+        .current_dir(cwd)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", HOME.as_str())
+        .env("XDG_CONFIG_HOME", format!("{}/.config", *HOME))
+        .output()
+    match output:
+        Ok(output) => GitResult{
+            success: output.status.success(),
+            stdout: decode(&output.stdout),
+            stderr: decode(&output.stderr),
+        }
+        Err(error) => failure(format!("Failed to spawn '/usr/bin/git': {error}"))
+
+fn absolute_path(path: &str) -> String:
+    if path.starts_with('/'):
+        return path.to_string()
+    let cwd = std.env.current_dir().unwrap_or_default()
+    format!("{}/{path}", cwd.display())
+
+fn basename(path: &str) -> String = path.split('/').filter(|part| !part.is_empty()).last().unwrap_or(path).to_string()
+
+fn xdg_path(variable: &str, fallback: &str) -> String = std.env.var(variable).unwrap_or_else(|_| format!("{}/{fallback}", *HOME))
+
+fn expand_home(path: &str) -> String:
+    if path == "~":
+        HOME.clone()
+    else if let Some(rest) = path.strip_prefix("~/"):
+        format!("{}/{rest}", *HOME)
+    else:
+        path.to_string()
+
+fn is_within(root: &str, path: &str) -> bool = path == root || path.starts_with(&format!("{root}/"))
+
+fn read_text_file(path: &str) -> Option[String] = std.fs.read(path).ok().map(|bytes| String.from_utf8_lossy(&bytes).into_owned())
+
+fn get_drydock_configured_roots() -> Vec[String]:
+    let config_path = format!("{}/drydock/config.toml", xdg_path("XDG_CONFIG_HOME", ".config"))
+    let Some(config) = read_text_file(&config_path) else:
+        return Vec.new()
+    let roots = Regex.new(r"(?:^|\n)roots\s*=\s*\[([\s\S]*?)\]").unwrap()
+    let string = Regex.new(r#""([^"\\]*(?:\\.[^"\\]*)*)""#).unwrap()
+    let block = roots.captures(&config).map_or("", |captures| captures.get(1).unwrap().as_str())
+    string
+        .captures_iter(block)
+        .map(|captures| expand_home(&captures[1]))
+        .filter(|root| !root.is_empty())
+        .collect()
+
+// JavaScript sorts strings by UTF-16 code units.
+fn sort_utf16(values: &mut Vec[String]) = values.sort_by(|left, right| left.encode_utf16().cmp(right.encode_utf16()))
+
+fn get_drydock_cached_roots(search_root: &str) -> Vec[String]:
+    let cache_path = format!("{}/drydock/state.json", xdg_path("XDG_CACHE_HOME", ".cache"))
+    let Some(state) = read_text_file(&cache_path).and_then(|text| serde_json.from_str[Value](&text).ok()) else:
+        return Vec.new()
+    let repos = match state.get("repos"):
+        None | Some(Value.Null) => return Vec.new()
+        Some(Value.Array(repos)) => repos
+        Some(_) => return Vec.new()
+    // Reading `.root` of a null entry throws in the original, which yields no roots.
+    if repos.iter().any(Value.is_null):
+        return Vec.new()
+    let unique: BTreeSet[String] = repos
+        .iter()
+        .filter_map(|repo| repo.get("root").and_then(Value.as_str))
+        .filter(|path| is_within(search_root, path))
+        .map(str.to_string)
+        .collect()
+    let mut roots: Vec[String] = unique.into_iter().collect()
+    sort_utf16(&mut roots)
+    roots
+
+fn normalize_branch(reference: &str) -> String:
+    reference
+        .strip_prefix("refs/heads/")
+        .or_else(|| reference.strip_prefix("refs/remotes/"))
+        .unwrap_or(reference)
+        .to_string()
+
+fn parse_date_field(value: &str) -> Result[DateField, String] = match value:
+    "author" => Ok(DateField.Author)
+    "committer" => Ok(DateField.Committer)
+    "either" => Ok(DateField.Either)
+    _ => Err(format!("Invalid --date-field: {value}"))
+
+fn parse_color(value: &str) -> Result[ColorMode, String] = match value:
+    "auto" => Ok(ColorMode.Auto)
+    "always" => Ok(ColorMode.Always)
+    "never" => Ok(ColorMode.Never)
+    _ => Err(format!("Invalid --color: {value}"))
+
+// Hand-rolled because clap and lexopt cannot reproduce the original's messages and order:
+// `--root -x` is a missing value, `-`, `--`, and `-abc` are unknown options, and `-h` after an
+// earlier error still fails.
+fn parse_options(args: &[String], default_root: &str) -> Result[Options, String]:
+    let mut date_input: Option[String] = None
+    let mut root = default_root.to_string()
+    let mut date_field = "author".to_string()
+    let mut color = "auto".to_string()
+    let mut verbose = false
+    let mut use_cache = true
+
+    let mut index = 0
+    while index < args.len():
+        let arg = args[index].as_str()
+        index += 1
+        if arg == "-h" || arg == "--help":
+            println!("{USAGE}")
+            std.process.exit(0)
+        if arg == "--verbose":
+            verbose = true
+            continue
+        if arg == "--no-cache":
+            use_cache = false
+            continue
+        if arg == "--root" || arg == "--date-field" || arg == "--color":
+            let value = match args.get(index):
+                Some(value) if !value.is_empty() && !value.starts_with('-') => value.clone()
+                _ => return Err(format!("{arg} requires a value"))
+            index += 1
+            match arg:
+                "--root" => root = value
+                "--date-field" => date_field = value
+                _ => color = value
+            continue
+        if let Some(value) = arg.strip_prefix("--root="):
+            root = value.to_string()
+            continue
+        if let Some(value) = arg.strip_prefix("--date-field="):
+            date_field = value.to_string()
+            continue
+        if let Some(value) = arg.strip_prefix("--color="):
+            color = value.to_string()
+            continue
+        if arg.starts_with('-'):
+            return Err(format!("Unknown option: {arg}"))
+        if date_input.as_deref().is_some_and(|input| !input.is_empty()):
+            return Err("Only one DATE may be provided".to_string())
+        date_input = Some(arg.to_string())
+
+    let date_input = date_input.filter(|input| !input.is_empty()).ok_or("DATE is required")?
+    Ok(Options{
+        date_input,
+        root: absolute_path(&root),
+        date_field: parse_date_field(&date_field)?,
+        color: parse_color(&color)?,
+        verbose,
+        use_cache,
+    })
+
+// Offset in minutes east of UTC for a `Z` or `±HH[:]MM` suffix accepted by `Date.parse`.
+fn parse_offset(timezone: &str) -> Option[i64]:
+    if timezone.eq_ignore_ascii_case("z"):
+        return Some(0)
+    let sign = if timezone.starts_with('-') then -1 else 1
+    let digits = timezone[1..].replace(':', "")
+    let hours: i64 = digits[..2].parse().ok()?
+    let minutes: i64 = digits[2..].parse().ok()?
+    (hours < 24 && minutes < 60).then_some(sign * (hours * 60 + minutes))
+
+fn parse_date_window(input: &str) -> Result[DateWindow, String]:
+    let invalid = || format!("Invalid ISO 8601 date: {input}")
+    let shape = Regex.new(r"^(\d{4}-\d{2}-\d{2})(?:T.*)?$").unwrap()
+    let label = shape.captures(input).ok_or_else(invalid)?[1].to_string()
+
+    // The time grammar `Date.parse` accepts after a calendar date.
+    let time = Regex.new(
+        r"^T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?|24:00(?::00(?:\.0+)?)?)(?:[Zz]|[+-](?:[01]\d|2[0-3]):?[0-5]\d)?$",
+    ).unwrap()
+    if input != label && !time.is_match(&input[label.len()..]):
+        return Err(invalid())
+    let parts: Vec[u32] = label.split('-').map(|part| part.parse().unwrap()).collect()
+    // `Date.UTC` maps years 0 through 99 to 1900 through 1999, so the original rejects them.
+    let date = NaiveDate.from_ymd_opt(parts[0] as i32, parts[1], parts[2]).filter(|_| parts[0] >= 100).ok_or_else(invalid)?
+    let timezone = Regex.new(r"(?i)(Z|[+-]\d{2}:?\d{2})$").unwrap().find(input).map_or("Z", |found| found.as_str())
+    let offset = parse_offset(timezone).ok_or_else(invalid)?
+    let start = date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis() - offset * 60_000
+    Ok(DateWindow{ label, start, end: start + 86_400_000 })
+
+fn iso_string(millis: i64) -> String = DateTime.from_timestamp_millis(millis).unwrap().to_rfc3339_opts(SecondsFormat.Millis, true)
+
+fn walk(directory: &str) -> Result[Vec[String], String]:
+    let error = |error: std.io.Error| format!("{error}: readdir '{directory}'")
+    let mut found = Vec.new()
+    let mut children = Vec.new()
+    for entry in std.fs.read_dir(directory).map_err(error)?:
+        let entry = entry.map_err(error)?
+        let name = entry.file_name().to_string_lossy().into_owned()
+        let kind = entry.file_type().map_err(error)?
+        if name == ".git" && (kind.is_file() || kind.is_dir()):
+            found.push(directory.to_string())
+            continue
+        if kind.is_dir() && !SKIPPED_DIRS.contains(&name.as_str()):
+            children.push(format!("{directory}/{name}"))
+    let nested = children.par_iter().map(|child| walk(child)).collect[Result[Vec[_], _]]()?
+    found.extend(nested.into_iter().flatten())
+    Ok(found)
+
+fn find_git_roots(root: &str) -> Result[Vec[String], String]:
+    let unique: BTreeSet[String] = walk(root)?.into_iter().collect()
+    let mut roots: Vec[String] = unique.into_iter().collect()
+    sort_utf16(&mut roots)
+    Ok(roots)
+
+fn get_common_dir(root: &str, verbose: bool) -> Option[String]:
+    let result = run_git(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"])
+    if !result.success && verbose:
+        eprintln!("Skipping {root}: {result.stderr.trim()}")
+    result.success.then(|| result.stdout.trim().to_string())
+
+fn get_worktrees(root: &str) -> Vec[Worktree]:
+    let result = run_git(root, &["worktree", "list", "--porcelain"])
+    if !result.success:
+        return Vec.new()
+
+    let mut worktrees: Vec[Worktree] = Vec.new()
+    let mut current: Option[Worktree] = None
+    let flush = |worktrees: &mut Vec[Worktree], current: Option[Worktree]|:
+        if let Some(mut worktree) = current.filter(|worktree| !worktree.path.is_empty()):
+            worktree.primary = worktrees.is_empty()
+            worktrees.push(worktree)
+
+    for line in result.stdout.split('\n'):
+        if let Some(path) = line.strip_prefix("worktree "):
+            flush(&mut worktrees, current.take())
+            current = Some(Worktree{ path: path.to_string(), head: String.new(), branch: None, primary: false })
+        else if let (Some(head), Some(worktree)) = (line.strip_prefix("HEAD "), current.as_mut()):
+            worktree.head = head.to_string()
+        else if let (Some(branch), Some(worktree)) = (line.strip_prefix("branch "), current.as_mut()):
+            worktree.branch = Some(branch.strip_prefix("refs/heads/").unwrap_or(branch).to_string())
+    flush(&mut worktrees, current)
+    worktrees
+
+fn get_default_branch(root: &str, worktrees: &[Worktree]) -> Option[String]:
+    let remote_head = run_git(root, &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])
+    if remote_head.success:
+        let reference = remote_head.stdout.trim()
+        let branch = reference.strip_prefix("refs/remotes/origin/").unwrap_or(reference)
+        if !branch.is_empty():
+            return Some(branch.to_string())
+
+    let branches = run_git(root, &["for-each-ref", "--format=%(refname:short)", "refs/heads"])
+    let local_branches: BTreeSet[&str] = branches.stdout.split('\n').filter(|branch| !branch.is_empty()).collect()
+    if local_branches.contains("main"):
+        return Some("main".to_string())
+    if local_branches.contains("master"):
+        return Some("master".to_string())
+    worktrees.iter().find(|worktree| worktree.primary).and_then(|worktree| worktree.branch.clone())
+
+fn parse_commits(output: &str) -> Vec[Commit]:
+    output
+        .split('\n')
+        .filter(|line| !line.is_empty())
+        .filter_map(|line|:
+            let fields: Vec[&str] = line.split('\0').collect()
+            let hash = fields[0]
+            let is_hash = (1..=64).contains(&hash.len()) && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            if fields.len() < 6 || !is_hash:
+                return None
+            Some(Commit{
+                hash: hash.to_string(),
+                author_date: fields[1].to_string(),
+                committer_date: fields[2].to_string(),
+                author_name: fields[3].to_string(),
+                author_email: fields[4].to_string(),
+                subject: fields[5].to_string(),
+            })
+        )
+        .collect()
+
+fn commit_is_in_window(commit: &Commit, window: &DateWindow, field: DateField) -> bool:
+    let in_window = |value: &str|:
+        DateTime.parse_from_rfc3339(value).is_ok_and(|time| (window.start..window.end).contains(&time.timestamp_millis()))
+    match field:
+        DateField.Author => in_window(&commit.author_date)
+        DateField.Committer => in_window(&commit.committer_date)
+        DateField.Either => in_window(&commit.author_date) || in_window(&commit.committer_date)
+
+fn get_commits(root: &str, worktrees: &[Worktree], window: &DateWindow, field: DateField) -> Vec[Commit]:
+    let mut args = vec![
+        "log".to_string(),
+        "--all".to_string(),
+        "--format=%H%x00%aI%x00%cI%x00%an%x00%ae%x00%s%x00".to_string(),
+        "--no-decorate".to_string(),
+        format!("--author={AUTHOR_PATTERN}"),
+    ]
+    args.extend(worktrees.iter().filter(|worktree| !worktree.head.is_empty() && worktree.branch.is_none()).map(|worktree| worktree.head.clone()))
+    if field == DateField.Committer:
+        args.push(format!("--since={iso_string(window.start)}"))
+        args.push(format!("--until={iso_string(window.end)}"))
+    let args: Vec[&str] = args.iter().map(String.as_str).collect()
+    let result = run_git(root, &args)
+    if !result.success:
+        return Vec.new()
+    parse_commits(&result.stdout)
+        .into_iter()
+        .filter(|commit| format!("{} {}", commit.author_name, commit.author_email).to_ascii_lowercase().contains("scarf"))
+        .filter(|commit| commit_is_in_window(commit, window, field))
+        .collect()
+
+fn get_containing_branches(root: &str, hash: &str) -> Vec[String]:
+    let contains = format!("--contains={hash}")
+    let result = run_git(root, &["for-each-ref", &contains, "--format=%(refname)", "refs/heads", "refs/remotes"])
+    if !result.success:
+        return Vec.new()
+    result.stdout.split('\n').filter(|reference| !reference.is_empty() && !reference.ends_with("/HEAD")).map(normalize_branch).collect()
+
+fn branch_matches(branch: &str, containing: &[String]) -> bool:
+    containing.iter().any(|reference| reference == branch || reference.ends_with(&format!("/{branch}")))
+
+fn make_row(root: &str, repository: &str, worktrees: &[Worktree], default_branch: Option[&str], commit: &Commit, field: DateField) -> Row:
+    let mut containing: Vec[String] = Vec.new()
+    for branch in get_containing_branches(root, &commit.hash):
+        if !containing.contains(&branch):
+            containing.push(branch)
+    let active: Vec[&Worktree] = worktrees
+        .par_iter()
+        .filter(|worktree|:
+            if let Some(branch) = &worktree.branch:
+                return branch_matches(branch, &containing)
+            !worktree.head.is_empty() && run_git(root, &["merge-base", "--is-ancestor", &commit.hash, &worktree.head]).success
+        )
+        .collect()
+    let is_main = default_branch.is_some_and(|branch| !branch.is_empty() && branch_matches(branch, &containing))
+    let has_linked_worktree = active.iter().any(|worktree| !worktree.primary)
+    let role = match (is_main, has_linked_worktree):
+        (true, true) => "main+worktree"
+        (true, false) => "main"
+        (false, true) => "branch+worktree"
+        (false, false) => "branch"
+    let worktree = active
+        .iter()
+        .map(|item|:
+            let name = if item.primary then "main" else item.branch.as_deref().unwrap_or("detached")
+            format!("{name}@{item.path}")
+        )
+        .collect[Vec[_]]()
+        .join(", ")
+    let selected_date = if field == DateField.Committer then &commit.committer_date else &commit.author_date
+    let or_dash = |value: String| if value.is_empty() then "-".to_string() else value
+
+    Row{
+        repository: repository.to_string(),
+        role: role.to_string(),
+        branch: or_dash(containing.join(", ")),
+        worktree: or_dash(worktree),
+        commit: commit.hash.chars().take(10).collect(),
+        date: selected_date.clone(),
+        author: format!("{} <{}>", commit.author_name, commit.author_email),
+        subject: commit.subject.clone(),
+    }
+
+fn truncate(value: &str, width: usize) -> String:
+    let characters: Vec[char] = value.chars().collect()
+    if characters.len() <= width:
+        return value.to_string()
+    if width < 2:
+        return characters[..width].iter().collect()
+    let left = width / 2
+    let right = (width - 1) / 2
+    let head: String = characters[..left].iter().collect()
+    let tail: String = characters[characters.len() - right..].iter().collect()
+    format!("{head}…{tail}")
+
+fn pad(value: &str, width: usize) -> String = format!("{value}{" ".repeat(width.saturating_sub(value.chars().count()))}")
+
+fn colorize(value: &str, color: &str, enabled: bool) -> String:
+    if enabled then format!("{color}{value}{ansi.RESET}") else value.to_string()
+
+// Deno.consoleSize tries stdin, stdout, then stderr.
+fn terminal_width() -> Option[usize]:
+    let size = terminal_size.terminal_size_of(std.io.stdin())
+        .or_else(|| terminal_size.terminal_size_of(std.io.stdout()))
+        .or_else(|| terminal_size.terminal_size_of(std.io.stderr()))
+    size.map(|(width, _)| width.0 as usize)
+
+fn print_table(rows: &[Row], use_color: bool):
+    let headers = ["Repository", "Role", "Branch", "Worktree", "Commit", "Date", "Author", "Subject"]
+    let terminal_width = terminal_width().unwrap_or(180) as i64
+    let widths = [18, 16, 26, 34, 10, 25, 24, (terminal_width - 165).clamp(20, 60) as usize]
+    let render = |values: &[&str], row_color: Option[&str]|:
+        values
+            .iter()
+            .zip(widths)
+            .map(|(value, width)|:
+                let cell = pad(&truncate(value, width), width)
+                match row_color:
+                    Some(color) => colorize(&cell, color, use_color)
+                    None => cell
+            )
+            .collect[Vec[_]]()
+            .join(" │ ")
+
+    println!("{colorize(&render(&headers, None), ansi.BOLD, use_color)}")
+    let rule = widths.map(|width| "─".repeat(width)).join("─┼─")
+    println!("{colorize(&rule, ansi.DIM, use_color)}")
+    for row in rows:
+        let row_color = if row.role.contains("main"):
+            ansi.GREEN
+        else if row.role.contains("worktree"):
+            ansi.CYAN
+        else:
+            ansi.YELLOW
+        let values = [
+            row.repository.as_str(),
+            &row.role,
+            &row.branch,
+            &row.worktree,
+            &row.commit,
+            &row.date,
+            &row.author,
+            &row.subject,
+        ]
+        println!("{render(&values, Some(row_color))}")
+
+fn run() -> Result[(), String]:
+    let configured_roots = get_drydock_configured_roots()
+    let args: Vec[String] = std.env.args().skip(1).collect()
+    let options = parse_options(&args, configured_roots.first().unwrap_or(&*DEFAULT_ROOT))?
+    let window = parse_date_window(&options.date_input)?
+    let root = std.fs.canonicalize(&options.root)
+        .map_err(|_| format!("Search root does not exist: {options.root}"))?
+        .to_string_lossy()
+        .into_owned()
+    let mut candidates = if options.use_cache then get_drydock_cached_roots(&root) else Vec.new()
+    let source = if candidates.is_empty() then "filesystem scan" else "drydock cache"
+    if candidates.is_empty():
+        candidates = find_git_roots(&root)?
+
+    if options.verbose:
+        eprintln!("Using {source}: {candidates.len()} git root(s).")
+    let common_dirs: Vec[Option[String]] = candidates.par_iter().map(|candidate| get_common_dir(candidate, options.verbose)).collect()
+    let mut groups: IndexMap[String, &str] = IndexMap.new()
+    for (common_dir, candidate) in common_dirs.into_iter().zip(&candidates):
+        if let Some(common_dir) = common_dir.filter(|dir| !dir.is_empty()):
+            groups.insert(common_dir, candidate)
+    if options.verbose:
+        eprintln!("Scanning {groups.len()} unique repository(s).")
+
+    let processed: Vec[Option[Vec[Row]]] = groups
+        .values()
+        .collect[Vec[_]]()
+        .par_iter()
+        .map(|candidate|:
+            let worktrees = get_worktrees(candidate)
+            if worktrees.is_empty():
+                return None
+            let default_branch = get_default_branch(candidate, &worktrees)
+            let primary = worktrees.iter().find(|worktree| worktree.primary).map_or(**candidate, |worktree| worktree.path.as_str())
+            let repository = basename(primary)
+            if options.verbose:
+                eprintln!("Scanning {repository} ({options.date_field.name()})")
+            let commits = get_commits(candidate, &worktrees, &window, options.date_field)
+            let rows = commits
+                .par_iter()
+                .map(|commit| make_row(candidate, &repository, &worktrees, default_branch.as_deref(), commit, options.date_field))
+                .collect()
+            Some(rows)
+        )
+        .collect()
+    let skipped = processed.iter().filter(|result| result.is_none()).count()
+    let mut rows: Vec[Row] = processed.into_iter().flatten().flatten().collect()
+
+    let collator: CollatorBorrowed = CollatorBorrowed.try_new(icu_locale.locale!("ko-KR").into(), CollatorOptions.default()).unwrap()
+    rows.sort_by(|left, right|:
+        collator
+            .compare(&left.date, &right.date)
+            .then_with(|| collator.compare(&left.repository, &right.repository))
+            .then_with(|| collator.compare(&left.commit, &right.commit))
+    )
+
+    let use_color = options.color == ColorMode.Always || (options.color == ColorMode.Auto && std.io.stdout().is_terminal())
+    println!("{colorize("Commits", ansi.BOLD, use_color)} on {window.label} ({options.date_field.name()} date, author scarf): {rows.len()}")
+    if rows.is_empty():
+        println!("No matching commits found.")
+    else:
+        print_table(&rows, use_color)
+    if options.verbose && skipped > 0:
+        eprintln!("Skipped {skipped} repository(s).")
+    Ok(())
+
+fn main():
+    if let Err(message) = run():
+        eprintln!("Error: {message}")
+        eprintln!("\n{USAGE}")
+        std.process.exit(1)
+
+#[cfg(test)]
+mod tests:
+    use super.*
+
+    #[test]
+    fn parse_date_window_accepts_a_date_with_an_iso_8601_offset():
+        let window = parse_date_window("2026-08-10T12:00:00+09:00").unwrap()
+        assert_eq!(iso_string(window.start), "2026-08-09T15:00:00.000Z")
+        assert_eq!(iso_string(window.end), "2026-08-10T15:00:00.000Z")
+
+    #[test]
+    fn parse_date_window_rejects_impossible_calendar_dates():
+        let error = parse_date_window("2026-02-30").unwrap_err()
+        assert!(error.contains("Invalid ISO 8601 date"), "{error}")
+
+    #[test]
+    fn commit_is_in_window_matches_the_selected_date_field():
+        let window = parse_date_window("2026-08-10").unwrap()
+        let commit = Commit{
+            hash: "a".repeat(40),
+            author_date: "2026-08-10T01:00:00+00:00".to_string(),
+            committer_date: "2026-08-11T01:00:00+00:00".to_string(),
+            author_name: "Test".to_string(),
+            author_email: "test@example.com".to_string(),
+            subject: "subject".to_string(),
+        }
+        assert!(commit_is_in_window(&commit, &window, DateField.Author), "author date should match")
+        assert!(!commit_is_in_window(&commit, &window, DateField.Committer), "committer date should not match")
+        assert!(commit_is_in_window(&commit, &window, DateField.Either), "either should match")

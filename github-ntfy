@@ -1,0 +1,584 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly APP_NAME="github-ntfy"
+readonly DEFAULT_STATE_DIR="/var/lib/github-ntfy"
+readonly DEFAULT_PER_PAGE="100"
+readonly DEFAULT_MAX_PAGES="10"
+readonly DEFAULT_NTFY_TIMEOUT="5"
+readonly DEFAULT_ICON_URL="https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  github-ntfy poll
+EOF
+}
+
+die() {
+  printf '%s\n' "$*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
+}
+
+require_env() {
+  local name="$1"
+  [[ -n "${!name:-}" ]] || die "missing environment variable: $name"
+}
+
+setup_state() {
+  STATE_DIR="${STATE_DIR:-$DEFAULT_STATE_DIR}"
+  LAST_MODIFIED_FILE="$STATE_DIR/last_modified"
+  SEEN_FILE="$STATE_DIR/seen.tsv"
+  LOCK_FILE="$STATE_DIR/lock"
+
+  mkdir -p "$STATE_DIR"
+  touch "$SEEN_FILE"
+}
+
+acquire_lock() {
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || die "another $APP_NAME run is already active"
+}
+
+split_http_response() {
+  local raw_file="$1"
+  local headers_file="$2"
+  local body_file="$3"
+
+  : >"$headers_file"
+  : >"$body_file"
+
+  awk -v headers_file="$headers_file" -v body_file="$body_file" '
+    BEGIN { target = headers_file }
+    /^\r?$/ {
+      if (target == headers_file) {
+        target = body_file
+        next
+      }
+    }
+    { print > target }
+  ' "$raw_file"
+}
+
+header_value() {
+  local name="$1"
+  local headers_file="$2"
+
+  awk -v name="$name" '
+    BEGIN { IGNORECASE = 1 }
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      lower = tolower(line)
+      needle = tolower(name) ":"
+      if (index(lower, needle) == 1) {
+        sub(/^[^:]+:[[:space:]]*/, "", line)
+        print line
+        exit
+      }
+    }
+  ' "$headers_file"
+}
+
+fetch_first_page() {
+  local raw_file="$1"
+  local page_path="$2"
+  local -a args
+  local rc=0
+
+  args=(api --include -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
+  if [[ -f "$LAST_MODIFIED_FILE" ]] && [[ -s "$LAST_MODIFIED_FILE" ]]; then
+    args+=(-H "If-Modified-Since: $(<"$LAST_MODIFIED_FILE")")
+  fi
+  args+=("$page_path")
+
+  set +e
+  gh "${args[@]}" >"$raw_file"
+  rc=$?
+  set -e
+
+  if [[ "$rc" -ne 0 ]] && [[ "$rc" -ne 1 ]]; then
+    return "$rc"
+  fi
+}
+
+fetch_page_body() {
+  local body_file="$1"
+  local page_path="$2"
+
+  gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "$page_path" >"$body_file"
+}
+
+seen_before() {
+  local key="$1"
+  grep -Fqx "$key" "$SEEN_FILE"
+}
+
+append_seen() {
+  local key="$1"
+  printf '%s\n' "$key" >>"$SEEN_FILE"
+}
+
+github_api_get() {
+  local endpoint="$1"
+  local response
+  local rc=0
+
+  set +e
+  response="$(gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "$endpoint" 2>/dev/null)"
+  rc=$?
+  set -e
+
+  [[ "$rc" -eq 0 ]] || return "$rc"
+  printf '%s' "$response"
+}
+
+pluralize_commit() {
+  if [[ "$1" -eq 1 ]]; then
+    printf 'commit'
+  else
+    printf 'commits'
+  fi
+}
+
+trim_multiline_text() {
+  local text="$1"
+
+  text="$(printf '%s' "$text" | jq -rRs 'split("\n") | map(gsub("^\\s+|\\s+$"; "")) | map(select(. != "")) | join("\n")')"
+  printf '%s' "$text"
+}
+
+append_detail_message() {
+  local detail="$1"
+  local base_message="$2"
+  local trimmed
+
+  trimmed="$(trim_multiline_text "$detail")"
+  if [[ -n "$trimmed" ]]; then
+    ENRICHED_MESSAGE="${trimmed}"$'\n'"${base_message}"
+  else
+    ENRICHED_MESSAGE="$base_message"
+  fi
+}
+
+enrich_pull_request_notification() {
+  local subject_url="$1"
+  local base_title="$2"
+  local base_message="$3"
+  local endpoint
+  local timeline_endpoint
+  local timeline_json
+  local pull_json
+  local activity_json
+  local activity_kind
+  local actor
+  local state
+  local body
+  local count
+  local commit_summary
+  local merged_by
+
+  ENRICHED_TITLE="$base_title"
+  ENRICHED_MESSAGE="$base_message"
+
+  endpoint="${subject_url#https://api.github.com}"
+  [[ -n "$endpoint" ]] || return 0
+  timeline_endpoint="${endpoint/\/pulls\//\/issues\/}"
+
+  if ! pull_json="$(github_api_get "$endpoint")"; then
+    pull_json='{}'
+  fi
+
+  if ! timeline_json="$(github_api_get "${timeline_endpoint}/timeline?per_page=100")"; then
+    return 0
+  fi
+
+  activity_json="$(jq -c '
+    def actor_name:
+      .user.login // .actor.login // .author.login // .author.name // .committer.login // .committer.name // "someone";
+    def event_time:
+      .submitted_at // .updated_at // .created_at // "";
+    def meaningful:
+      (.event // "") as $event
+      | $event == "reviewed"
+        or $event == "commented"
+        or $event == "committed"
+        or $event == "merged"
+        or $event == "review_requested"
+        or $event == "review_request_removed"
+        or $event == "review_dismissed"
+        or $event == "closed"
+        or $event == "reopened"
+        or $event == "ready_for_review"
+        or $event == "convert_to_draft";
+    def cleaned_commit_message:
+      (.message // .commit.message // "")
+      | split("\n")
+      | map(gsub("^\\s+|\\s+$"; ""))
+      | map(select(. != ""))
+      | .[0] // "";
+    (map(select(meaningful)) | sort_by(event_time)) as $events
+    | if ($events | length) == 0 then
+        empty
+      else
+        ($events[-1]) as $last
+        | if ($last.event == "committed") then
+            ($last | actor_name) as $commit_actor
+            | reduce ($events | reverse[]) as $event ({done: false, items: []};
+                if .done then
+                  .
+                elif $event.event == "committed" and (($event | actor_name) == $commit_actor) then
+                  .items += [$event]
+                else
+                  .done = true
+                end
+              )
+            | .items
+            | reverse
+            | {
+                kind: "committed",
+                actor: ($last | actor_name),
+                count: length,
+                body: ([ .[] | cleaned_commit_message ] | map(select(. != "")) | .[:3] | join("\n"))
+              }
+          elif ($last.event == "reviewed") then
+            {
+              kind: "reviewed",
+              actor: ($last | actor_name),
+              state: (($last.state // "") | ascii_upcase),
+              body: ($last.body // "")
+            }
+          elif ($last.event == "commented") then
+            {
+              kind: "commented",
+              actor: ($last | actor_name),
+              body: ($last.body // "")
+            }
+          elif ($last.event == "review_requested") then
+            {
+              kind: "review_requested",
+              actor: ($last.review_requester.login // ($last | actor_name)),
+              requested: ($last.requested_reviewer.login // $last.requested_team.slug // "someone"),
+              body: ""
+            }
+          elif ($last.event == "review_request_removed") then
+            {
+              kind: "review_request_removed",
+              actor: ($last.review_requester.login // ($last | actor_name)),
+              requested: ($last.requested_reviewer.login // $last.requested_team.slug // "someone"),
+              body: ""
+            }
+          elif ($last.event == "review_dismissed") then
+            {
+              kind: "review_dismissed",
+              actor: ($last | actor_name),
+              body: ($last.dismissed_review.dismissal_message // "")
+            }
+          else
+            {
+              kind: ($last.event // ""),
+              actor: ($last | actor_name),
+              body: ($last.body // "")
+            }
+          end
+      end
+  ' <<<"$timeline_json")"
+
+  [[ -n "$activity_json" ]] || return 0
+
+  activity_kind="$(jq -r '.kind // ""' <<<"$activity_json")"
+  actor="$(jq -r '.actor // "someone"' <<<"$activity_json")"
+  body="$(jq -r '.body // ""' <<<"$activity_json")"
+  merged_by="$(jq -r '.merged_by.login // ""' <<<"$pull_json")"
+
+  case "$activity_kind" in
+    reviewed)
+      state="$(jq -r '.state // ""' <<<"$activity_json")"
+      case "$state" in
+        APPROVED)
+          ENRICHED_TITLE="@${actor} approved ${base_title}"
+          ;;
+        CHANGES_REQUESTED)
+          ENRICHED_TITLE="@${actor} requested changes on ${base_title}"
+          ;;
+        COMMENTED)
+          ENRICHED_TITLE="@${actor} reviewed ${base_title}"
+          ;;
+        DISMISSED)
+          ENRICHED_TITLE="@${actor} dismissed review on ${base_title}"
+          ;;
+        *)
+          ENRICHED_TITLE="@${actor} reviewed ${base_title}"
+          ;;
+      esac
+      append_detail_message "$body" "$base_message"
+      ;;
+    commented)
+      ENRICHED_TITLE="@${actor} commented on ${base_title}"
+      append_detail_message "$body" "$base_message"
+      ;;
+    committed)
+      count="$(jq -r '.count // 1' <<<"$activity_json")"
+      commit_summary="$(jq -r '.body // ""' <<<"$activity_json")"
+      ENRICHED_TITLE="@${actor} pushed ${count} $(pluralize_commit "$count") to ${base_title}"
+      append_detail_message "$commit_summary" "$base_message"
+      ;;
+    merged)
+      if [[ -n "$merged_by" ]]; then
+        actor="$merged_by"
+      fi
+      ENRICHED_TITLE="@${actor} merged ${base_title}"
+      append_detail_message "$body" "$base_message"
+      ;;
+    review_requested)
+      ENRICHED_TITLE="@${actor} requested review on ${base_title}"
+      append_detail_message "Requested from @$(jq -r '.requested // "someone"' <<<"$activity_json")" "$base_message"
+      ;;
+    review_request_removed)
+      ENRICHED_TITLE="@${actor} removed review request on ${base_title}"
+      append_detail_message "Removed for @$(jq -r '.requested // "someone"' <<<"$activity_json")" "$base_message"
+      ;;
+    review_dismissed)
+      ENRICHED_TITLE="@${actor} dismissed review on ${base_title}"
+      append_detail_message "$body" "$base_message"
+      ;;
+    closed)
+      if [[ "$(jq -r '.merged // false' <<<"$pull_json")" == "true" ]]; then
+        if [[ -n "$merged_by" ]]; then
+          actor="$merged_by"
+        fi
+        ENRICHED_TITLE="@${actor} merged ${base_title}"
+      else
+        ENRICHED_TITLE="@${actor} closed ${base_title}"
+      fi
+      append_detail_message "$body" "$base_message"
+      ;;
+    reopened)
+      ENRICHED_TITLE="@${actor} reopened ${base_title}"
+      append_detail_message "$body" "$base_message"
+      ;;
+    ready_for_review)
+      ENRICHED_TITLE="@${actor} marked ${base_title} ready for review"
+      append_detail_message "$body" "$base_message"
+      ;;
+    convert_to_draft)
+      ENRICHED_TITLE="@${actor} converted ${base_title} to draft"
+      append_detail_message "$body" "$base_message"
+      ;;
+  esac
+}
+
+enrich_notification() {
+  local subject_type="$1"
+  local subject_url="$2"
+  local base_title="$3"
+  local base_message="$4"
+
+  ENRICHED_TITLE="$base_title"
+  ENRICHED_MESSAGE="$base_message"
+
+  case "$subject_type" in
+    PullRequest)
+      enrich_pull_request_notification "$subject_url" "$base_title" "$base_message"
+      ;;
+  esac
+}
+
+send_ntfy() {
+  local title="$1"
+  local message="$2"
+  local click_url="$3"
+  local icon_url="$4"
+  local tags="$5"
+  local priority="$6"
+  local -a args
+
+  args=(--silent --show-error --fail --max-time "${NTFY_TIMEOUT:-$DEFAULT_NTFY_TIMEOUT}" -X POST "$NTFY_URL")
+  args+=(-H "Title: $title")
+  args+=(-H "Click: $click_url")
+  args+=(-H "Icon: $icon_url")
+  args+=(-H "Tags: $tags")
+  args+=(-H "Priority: $priority")
+  if [[ -n "${NTFY_TOKEN:-}" ]]; then
+    args+=(-H "Authorization: Bearer $NTFY_TOKEN")
+  fi
+  args+=(--data-binary "$message")
+
+  curl "${args[@]}" >/dev/null
+}
+
+process_body() {
+  local body_file="$1"
+  local key
+  local subject_type
+  local subject_url
+  local title
+  local message
+  local click_url
+  local icon_url
+  local tags
+  local priority
+
+  while IFS=$'\t' read -r key subject_type subject_url title message click_url icon_url tags priority; do
+    [[ -n "$key" ]] || continue
+    if seen_before "$key"; then
+      continue
+    fi
+
+    enrich_notification "$subject_type" "$subject_url" "$title" "$message"
+    send_ntfy "$ENRICHED_TITLE" "$ENRICHED_MESSAGE" "$click_url" "$icon_url" "$tags" "$priority"
+    append_seen "$key"
+  done < <(
+    jq -r '
+      def click_url:
+        if .subject.url == null or .subject.url == "" then
+          .repository.html_url
+        elif .subject.type == "PullRequest" then
+          (.subject.url
+            | sub("^https://api.github.com/repos/"; "https://github.com/")
+            | sub("/pulls/"; "/pull/")
+            | sub("/issues/"; "/pull/"))
+        elif .subject.type == "Issue" then
+          (.subject.url | sub("^https://api.github.com/repos/"; "https://github.com/"))
+        elif .subject.type == "Commit" then
+          (.subject.url
+            | sub("^https://api.github.com/repos/"; "https://github.com/")
+            | sub("/commits/"; "/commit/"))
+        elif .subject.type == "Discussion" then
+          (.subject.url | sub("^https://api.github.com/repos/"; "https://github.com/"))
+        elif .subject.type == "Release" then
+          (.subject.url
+            | sub("^https://api.github.com/repos/"; "https://github.com/")
+            | sub("/releases/[0-9]+$"; "/releases"))
+        else
+          .repository.html_url
+        end;
+
+      def type_tag:
+        if .subject.type == "PullRequest" then "pr"
+        elif .subject.type == "Issue" then "issue"
+        elif .subject.type == "Commit" then "commit"
+        elif .subject.type == "Discussion" then "discussion"
+        elif .subject.type == "Release" then "release"
+        else "notification"
+        end;
+
+      def reason_tag:
+        if .reason == null or .reason == "" then "github"
+        else .reason
+        end;
+
+      def icon_url:
+        (.repository.owner.avatar_url // .repository.owner.avatarUrl // "")
+        | if . == "" then
+            $default_icon_url
+          else
+            .
+          end;
+
+      def priority:
+        if .reason == "security_alert" then 5
+        elif .reason == "mention" or .reason == "team_mention" or .reason == "review_requested" then 4
+        else 3
+        end;
+
+      .[]
+      | select(.unread == true)
+      | [
+          ((.id | tostring) + "|" + .updated_at),
+          ((.subject.type // "Notification") | gsub("[\t\r\n]+"; " ")),
+          ((.subject.url // "") | gsub("[\t\r\n]+"; " ")),
+          ((.subject.title // .repository.full_name) | gsub("[\t\r\n]+"; " ")),
+          (((.repository.full_name // "unknown") + " [" + (.reason // "notification") + "] " + (.subject.type // "Notification")) | gsub("[\t\r\n]+"; " ")),
+          (click_url | gsub("[\t\r\n]+"; " ")),
+          (icon_url | gsub("[\t\r\n]+"; " ")),
+          ((["github", type_tag, reason_tag] | unique | join(",")) | gsub("[\t\r\n]+"; " ")),
+          (priority | tostring)
+        ]
+      | @tsv
+    ' --arg default_icon_url "$DEFAULT_ICON_URL" "$body_file"
+  )
+}
+
+poll_notifications() {
+  local per_page="${PER_PAGE:-$DEFAULT_PER_PAGE}"
+  local max_pages="${MAX_PAGES:-$DEFAULT_MAX_PAGES}"
+  local participating="${PARTICIPATING:-false}"
+  local page=1
+  local page_path
+  local raw_file
+  local headers_file
+  local body_file
+  local status_code
+  local count
+  local new_last_modified=""
+
+  raw_file="$(mktemp)"
+  headers_file="$(mktemp)"
+  body_file="$(mktemp)"
+
+  page_path="/notifications?all=false&participating=${participating}&per_page=${per_page}&page=1"
+  fetch_first_page "$raw_file" "$page_path"
+  split_http_response "$raw_file" "$headers_file" "$body_file"
+
+  status_code="$(awk 'NR == 1 { print $2 }' "$headers_file")"
+  case "$status_code" in
+    304)
+      rm -f "$raw_file" "$headers_file" "$body_file"
+      return 0
+      ;;
+    200)
+      new_last_modified="$(header_value "Last-Modified" "$headers_file")"
+      process_body "$body_file"
+      ;;
+    *)
+      die "unexpected GitHub response status: ${status_code:-unknown}"
+      ;;
+  esac
+
+  count="$(jq 'length' "$body_file")"
+  while [[ "$count" -ge "$per_page" ]] && [[ "$page" -lt "$max_pages" ]]; do
+    page="$((page + 1))"
+    page_path="/notifications?all=false&participating=${participating}&per_page=${per_page}&page=${page}"
+    fetch_page_body "$body_file" "$page_path"
+    count="$(jq 'length' "$body_file")"
+    [[ "$count" -gt 0 ]] || break
+    process_body "$body_file"
+  done
+
+  if [[ -n "$new_last_modified" ]]; then
+    printf '%s\n' "$new_last_modified" >"$LAST_MODIFIED_FILE"
+  fi
+
+  rm -f "$raw_file" "$headers_file" "$body_file"
+}
+
+main() {
+  require_command gh
+  require_command jq
+  require_command curl
+  require_command flock
+  require_env NTFY_URL
+
+  setup_state
+  acquire_lock
+
+  case "${1:-poll}" in
+    poll)
+      poll_notifications
+      ;;
+    -h|--help|help)
+      usage
+      ;;
+    *)
+      usage
+      die "unknown command: $1"
+      ;;
+  esac
+}
+
+main "$@"

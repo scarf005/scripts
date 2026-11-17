@@ -1,0 +1,291 @@
+#!/usr/bin/env fish
+
+set -g rimworld_dir (test -n "$RIMWORLD_DIR"; and echo $RIMWORLD_DIR; or echo /media/scarf/@steam/SteamLibrary/steamapps/common/RimWorld)
+set -g mods_config (test -n "$RIMWORLD_MODS_CONFIG"; and echo $RIMWORLD_MODS_CONFIG; or echo '/home/scarf/.config/unity3d/Ludeon Studios/RimWorld by Ludeon Studios/Config/ModsConfig.xml')
+
+function usage
+    echo 'Usage: rw <command> [mod-dir]'
+    echo
+    echo 'Commands:'
+    echo '  root             print the enclosing RimWorld mod directory'
+    echo '  build            run just build, make, or a single production project build'
+    echo '  install          build, then sync runtime files to RimWorld/Mods/<mod-dir-name>'
+    echo '  enable           enable the mod in ModsConfig.xml'
+    echo '  install-enable   install and enable the mod'
+    echo '  fmt              run the project fmt recipe'
+    echo '  test             run the project test recipe'
+    echo '  validate         validate About.xml, LoadFolders.xml, and all runtime XML'
+end
+
+function test_usage
+    echo 'Usage: rw test [--filter EXPRESSION] [mod-dir]'
+    echo
+    echo 'Options:'
+    echo '  -f, --filter EXPRESSION  select tests with a DevTools filter expression'
+    echo '  -h, --help               show this help'
+    echo
+    echo 'Filter fields: method, class, namespace, category, type, status'
+    echo 'Operators: ==, !=, =~, !~, &&, ||'
+    echo
+    echo 'Examples:'
+    echo "  rw test --filter 'method == RoadkillManhunter'"
+    echo "  rw test --filter 'method == RoadkillManhunter || method == ManhunterTargeting'"
+end
+
+function fail --argument-names message
+    echo "rw: $message" >&2
+    exit 1
+end
+
+function mod_root --argument-names start
+    set -l directory (realpath "$start")
+    test -d "$directory"; or set directory (dirname "$directory")
+
+    while true
+        if test -f "$directory/About/About.xml"
+            echo "$directory"
+            return 0
+        end
+
+        set -l parent (dirname "$directory")
+        test "$parent" = "$directory"; and return 1
+        set directory "$parent"
+    end
+end
+
+function has_just_recipe --argument-names root recipe
+    just --justfile "$root/justfile" --show "$recipe" >/dev/null 2>&1
+end
+
+function run_just_recipe --argument-names root recipe
+    just --justfile "$root/justfile" "$recipe"
+end
+
+function generic_build --argument-names root
+    set -l solutions (find "$root" -path '*/bin' -prune -o -path '*/obj' -prune -o -name '*.sln' -print)
+    if test (count $solutions) -gt 1
+        set -l mod_name (python3 -c "
+import xml.etree.ElementTree as ET
+print(ET.parse('$root/About/About.xml').getroot().findtext('name') or '')
+")
+        set -l normalized_mod_name (string lower -- "$mod_name" | string replace -ar '[^a-z0-9]' '')
+        set -l matching_solutions
+        for solution in $solutions
+            set -l solution_name (path basename "$solution" | string replace -r '\.sln$' '')
+            set -l normalized_solution_name (string lower -- "$solution_name" | string replace -ar '[^a-z0-9]' '')
+            if test "$normalized_solution_name" = "$normalized_mod_name"
+                set -a matching_solutions "$solution"
+            end
+        end
+        if test (count $matching_solutions) -eq 1
+            mise exec dotnet@8.0.422 -- dotnet build "$matching_solutions[1]" -c Release
+            return
+        end
+    end
+
+    if test -f "$root/Makefile"
+        command make -C "$root"
+        return
+    end
+
+    if test (count $solutions) -eq 1
+        mise exec dotnet@8.0.422 -- dotnet build "$solutions[1]" -c Release
+        return
+    end
+
+    set -l projects (find "$root" -path '*/bin' -prune -o -path '*/obj' -prune -o -path '*/Tests/*' -prune -o -path '*/Test/*' -prune -o \( -name '*.csproj' -o -name '*.fsproj' \) -print)
+    if test (count $projects) -eq 1
+        mise exec dotnet@8.0.422 -- dotnet build "$projects[1]" -c Release
+        return
+    end
+
+    if test (count $projects) -eq 0
+        validate "$root"
+        return
+    end
+
+    fail "multiple projects found; add a justfile build recipe"
+end
+
+function build --argument-names root
+    if test -f "$root/justfile"; and has_just_recipe "$root" build
+        run_just_recipe "$root" build
+    else
+        generic_build "$root"
+    end
+end
+
+function validate --argument-names root
+    python3 -c '
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+root = Path(sys.argv[1])
+for required in (root / "About" / "About.xml",):
+    if not required.is_file():
+        raise SystemExit(f"Missing required file: {required}")
+for path in sorted(root.rglob("*.xml")):
+    if any(part in {".git", "Source", "Tests", "bin", "obj"} for part in path.relative_to(root).parts):
+        continue
+    try:
+        ET.parse(path)
+    except ET.ParseError as error:
+        raise SystemExit(f"Invalid XML: {path}: {error}")
+print(f"Validated {root}")
+' "$root"
+end
+
+function install --argument-names root
+    if test -f "$root/justfile"; and has_just_recipe "$root" install
+        run_just_recipe "$root" install
+        return
+    end
+
+    build "$root"; or return
+    set -l mods_dir "$rimworld_dir/Mods"
+    test -d "$mods_dir"; or fail "RimWorld Mods directory not found: $mods_dir"
+
+    set -l mod_name (python3 -c "
+import xml.etree.ElementTree as ET
+root = ET.parse('$root/About/About.xml').getroot()
+name = root.findtext('name')
+if not name: raise SystemExit(1)
+print(name.strip())
+" 2>/dev/null; or basename "$root")
+    set -l destination "$mods_dir/$mod_name"
+    mkdir -p "$destination"
+    rsync --archive --delete --delete-excluded \
+        --exclude '/.*' \
+        --exclude '/Source/' \
+        --exclude '/Tests/' \
+        --exclude '/Test/' \
+        --exclude '/README*' \
+        --exclude '/LICENSE*' \
+        --exclude '/justfile' \
+        --exclude '/*.sln' \
+        --exclude '/*.csproj' \
+        --exclude '/*.fsproj' \
+        --exclude '/Makefile' \
+        "$root/" "$destination/"
+    echo "Installed $mod_name to $destination"
+end
+
+function enable --argument-names root
+    if test -f "$root/justfile"
+        if has_just_recipe "$root" install-enable
+            run_just_recipe "$root" install-enable
+            return
+        else if has_just_recipe "$root" enable
+            run_just_recipe "$root" enable
+            return
+        end
+    end
+
+    pgrep -x RimWorldLinux >/dev/null; and fail 'close RimWorld before enabling a mod'
+    test -f "$mods_config"; or fail "ModsConfig.xml not found: $mods_config"
+    python3 -c '
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+about, config = map(Path, sys.argv[1:])
+package_id = (ET.parse(about).getroot().findtext("packageId") or "").strip()
+if not package_id:
+    raise SystemExit(f"About.xml has no packageId: {about}")
+tree = ET.parse(config)
+active = tree.getroot().find("activeMods")
+if active is None:
+    raise SystemExit(f"Missing activeMods: {config}")
+if package_id in {(node.text or "").strip() for node in active.findall("li")}:
+    print(f"{package_id} is already enabled.")
+    raise SystemExit(0)
+ET.SubElement(active, "li").text = package_id
+ET.indent(tree, space="  ")
+temporary = config.with_suffix(config.suffix + ".tmp")
+tree.write(temporary, encoding="utf-8", xml_declaration=True)
+temporary.chmod(config.stat().st_mode)
+temporary.replace(config)
+print(f"Enabled {package_id} in {config}.")
+' "$root/About/About.xml" "$mods_config"
+end
+
+set -l command $argv[1]
+test -n "$command"; or begin; usage; exit 1; end
+set -e argv[1]
+
+if contains -- "$command" -h --help help
+    usage
+    exit 0
+end
+
+set -l test_filter 'namespace == Vehicles.Testing'
+if test "$command" = test
+    set -l positional_args
+    while test (count $argv) -gt 0
+        switch "$argv[1]"
+            case -h --help help
+                test_usage
+                exit 0
+            case -f --filter
+                test (count $argv) -ge 2; or fail "$argv[1] requires an expression"
+                set test_filter "$argv[2]"
+                set argv $argv[3..-1]
+            case '-*'
+                fail "unknown test option: $argv[1]"
+            case '*'
+                set -a positional_args "$argv[1]"
+                set argv $argv[2..-1]
+        end
+    end
+    set argv $positional_args
+else if contains -- "$command" root build install enable install-enable fmt validate
+    if test (count $argv) -eq 1; and contains -- "$argv[1]" -h --help help
+        echo "Usage: rw $command [mod-dir]"
+        exit 0
+    end
+end
+
+if test (count $argv) -gt 1
+    fail 'expected at most one mod directory'
+end
+set -l start
+if test (count $argv) -eq 1
+    set start $argv[1]
+else
+    set start (pwd)
+end
+set -l root (mod_root "$start"); or fail "no About/About.xml found above $start"
+
+switch "$command"
+    case root
+        echo "$root"
+    case build
+        build "$root"
+    case install
+        install "$root"
+    case enable
+        enable "$root"
+    case install-enable
+        if test -f "$root/justfile"; and has_just_recipe "$root" install-enable
+            run_just_recipe "$root" install-enable
+        else if test -f "$root/justfile"; and has_just_recipe "$root" enable
+            run_just_recipe "$root" enable
+        else
+            install "$root"; and enable "$root"
+        end
+    case fmt
+        test -f "$root/justfile"; or fail "$command requires a justfile recipe"
+        has_just_recipe "$root" "$command"; or fail "justfile has no $command recipe"
+        run_just_recipe "$root" "$command"
+    case test
+        test -f "$root/justfile"; or fail 'test requires a justfile recipe'
+        has_just_recipe "$root" test; or fail 'justfile has no test recipe'
+        set -lx RIMWORLD_TEST_FILTER "$test_filter"
+        run_just_recipe "$root" test
+    case validate
+        validate "$root"
+    case '*'
+        usage
+        exit 1
+end

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+trailers=()
+while IFS= read -r line; do
+  [[ -n "$line" ]] && trailers+=(--trailer "$line")
+done < <("$HOME/.local/bin/assisted-by" "gpt-5.4-codex" "opencode")
+exec git -c trailer.ifexists=addIfDifferent commit "$@" "${trailers[@]}"

@@ -1,0 +1,599 @@
+#!/usr/bin/env bash
+
+set -u
+
+usage() {
+  echo "Usage: notify [OPTIONS] <summary> [body]"
+  echo "Examples:"
+  echo "  notify --app-name MyApp \"Build finished\" \"All tests passed\""
+  echo "  notify -u critical \"Deploy failed\""
+  echo "  notify --id ses_example \"Build 2/3\" \"Still running\""
+  echo "  notify --click https://github.com/owner/repo/pull/123 \"PR opened\" \"Review ready\""
+}
+
+title=""
+message=""
+app_name=""
+app_name_explicit=0
+notify_timeout_ms=0
+notify_id=""
+click_url=""
+declare -a notify_send_args=()
+
+build_notify_send_args() {
+  local -a raw_args=("$@")
+  local -a filtered_args=()
+  local i=0
+
+  while [[ $i -lt ${#raw_args[@]} ]]; do
+    local arg="${raw_args[$i]}"
+    case "$arg" in
+      --id=*)
+        ;;
+      --click=*)
+        ;;
+      --id)
+        i=$((i + 1))
+        if [[ $i -ge ${#raw_args[@]} ]]; then
+          usage
+          exit 1
+        fi
+        ;;
+      --click)
+        i=$((i + 1))
+        if [[ $i -ge ${#raw_args[@]} ]]; then
+          usage
+          exit 1
+        fi
+        ;;
+      *)
+        filtered_args+=("$arg")
+        ;;
+    esac
+    i=$((i + 1))
+  done
+
+  notify_send_args=("${filtered_args[@]}")
+}
+
+if [[ $# -gt 0 ]] && [[ "$1" == "--await-click" ]]; then
+  notify_send_args=("$@")
+else
+  if [[ $# -eq 0 ]]; then
+    usage
+    exit 1
+  fi
+
+  args=("$@")
+  declare -a positional=()
+
+  i=0
+  while [[ $i -lt ${#args[@]} ]]; do
+    arg="${args[$i]}"
+    case "$arg" in
+      --)
+        i=$((i + 1))
+        while [[ $i -lt ${#args[@]} ]]; do
+          positional+=("${args[$i]}")
+          i=$((i + 1))
+        done
+        break
+        ;;
+      --app-name=*)
+        app_name="${arg#*=}"
+        app_name_explicit=1
+        ;;
+      --id=*)
+        notify_id="${arg#*=}"
+        ;;
+      --click=*)
+        click_url="${arg#*=}"
+        ;;
+      -a|--app-name)
+        i=$((i + 1))
+        if [[ $i -ge ${#args[@]} ]]; then
+          usage
+          exit 1
+        fi
+        app_name="${args[$i]}"
+        app_name_explicit=1
+        ;;
+      --id)
+        i=$((i + 1))
+        if [[ $i -ge ${#args[@]} ]]; then
+          usage
+          exit 1
+        fi
+        notify_id="${args[$i]}"
+        ;;
+      --click)
+        i=$((i + 1))
+        if [[ $i -ge ${#args[@]} ]]; then
+          usage
+          exit 1
+        fi
+        click_url="${args[$i]}"
+        ;;
+      --expire-time=*)
+        notify_timeout_ms="${arg#*=}"
+        ;;
+      -t|--expire-time)
+        i=$((i + 1))
+        if [[ $i -ge ${#args[@]} ]]; then
+          usage
+          exit 1
+        fi
+        notify_timeout_ms="${args[$i]}"
+        ;;
+      -t*)
+        notify_timeout_ms="${arg#-t}"
+        ;;
+      -a*)
+        app_name="${arg#-a}"
+        app_name_explicit=1
+        ;;
+      -u|--urgency|-i|--icon|-c|--category|-h|--hint|-A|--action|-r|--replace-id)
+        i=$((i + 1))
+        if [[ $i -ge ${#args[@]} ]]; then
+          usage
+          exit 1
+        fi
+        ;;
+      -e|--transient|-p|--print-id)
+        ;;
+      --*)
+        ;;
+      -*)
+        ;;
+      *)
+        positional+=("$arg")
+        ;;
+    esac
+    i=$((i + 1))
+  done
+
+  if [[ ${#positional[@]} -eq 0 ]]; then
+    usage
+    exit 1
+  fi
+
+  build_notify_send_args "$@"
+
+  title="${positional[0]}"
+  if [[ ${#positional[@]} -ge 2 ]]; then
+    message="${positional[1]}"
+    j=2
+    while [[ $j -lt ${#positional[@]} ]]; do
+      message+=" ${positional[$j]}"
+      j=$((j + 1))
+    done
+  else
+    message="$title"
+  fi
+fi
+
+use_host_exec=0
+if [[ -n "${CONTAINER_ID:-}" ]] && command -v distrobox-host-exec >/dev/null 2>&1; then
+  use_host_exec=1
+fi
+
+run_cmd() {
+  if [[ "$use_host_exec" == "1" ]]; then
+    distrobox-host-exec "$@"
+  else
+    "$@"
+  fi
+}
+
+is_screen_locked() {
+  if ! command -v loginctl >/dev/null 2>&1; then
+    return 1
+  fi
+
+  local -a session_ids=()
+
+  if [[ -n "${XDG_SESSION_ID:-}" ]]; then
+    session_ids+=("$XDG_SESSION_ID")
+  fi
+
+  if [[ -n "${USER:-}" ]]; then
+    local user_sessions
+    user_sessions="$(loginctl show-user "$USER" -p Sessions --value 2>/dev/null)"
+    if [[ -n "$user_sessions" ]]; then
+      # shellcheck disable=SC2206
+      local parsed=($user_sessions)
+      session_ids+=("${parsed[@]}")
+    fi
+  fi
+
+  if [[ ${#session_ids[@]} -eq 0 ]]; then
+    return 1
+  fi
+
+  local sid
+  for sid in "${session_ids[@]}"; do
+    local session_user
+    session_user="$(loginctl show-session "$sid" -p Name --value 2>/dev/null)"
+    if [[ -n "${USER:-}" ]] && [[ -n "$session_user" ]] && [[ "$session_user" != "$USER" ]]; then
+      continue
+    fi
+
+    local locked_hint
+    locked_hint="$(loginctl show-session "$sid" -p LockedHint --value 2>/dev/null)"
+    if [[ "$locked_hint" == "yes" ]]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+is_ssh_session() {
+  [[ -n "${SSH_CONNECTION:-}" ]] && return 0
+  [[ -n "${SSH_CLIENT:-}" ]] && return 0
+  [[ -n "${SSH_TTY:-}" ]] && return 0
+  return 1
+}
+
+# Outdoors: phone not reachable over KDE Connect, but online over Tailscale.
+outdoors_state=""
+is_outdoors() {
+  if [[ -z "$outdoors_state" ]]; then
+    outdoors_state=no
+    if [[ -z "$(run_cmd kdeconnect-cli -a --id-only 2>/dev/null)" ]] &&
+      run_cmd tailscale status --json 2>/dev/null | jq -e 'any(.Peer[]?; .OS == "android" and .Online)' >/dev/null 2>&1; then
+      outdoors_state=yes
+    fi
+  fi
+  [[ "$outdoors_state" == "yes" ]]
+}
+
+should_send_ntfy() {
+  is_ssh_session && return 0
+  is_screen_locked && return 0
+  is_outdoors && return 0
+  return 1
+}
+
+can_send_notify_send() {
+  is_ssh_session && return 1
+  is_outdoors && return 1
+  command -v notify-send >/dev/null 2>&1 || return 1
+  return 0
+}
+
+normalize_ntfy_title() {
+  local raw_title="${1:-}"
+  local normalized_title
+
+  normalized_title="$(printf '%s' "$raw_title" | tr '\r\n' ' ' | tr -s ' ')"
+  normalized_title="${normalized_title# }"
+  normalized_title="${normalized_title% }"
+
+  printf '%s\n' "$normalized_title"
+}
+
+normalize_ntfy_click_url() {
+  local raw_click_url="${1:-}"
+  local normalized_click_url
+
+  normalized_click_url="$(printf '%s' "$raw_click_url" | tr '\r\n' ' ' | tr -s ' ')"
+  normalized_click_url="${normalized_click_url# }"
+  normalized_click_url="${normalized_click_url% }"
+
+  printf '%s\n' "$normalized_click_url"
+}
+
+normalize_ntfy_sequence_id() {
+  local raw_id="${1:-}"
+  local normalized_id
+
+  normalized_id="$(printf '%s' "$raw_id" | tr -c 'A-Za-z0-9._-' '-')"
+  normalized_id="${normalized_id#-}"
+  normalized_id="${normalized_id%-}"
+
+  if [[ -z "$normalized_id" || "$normalized_id" != "$raw_id" ]]; then
+    if command -v sha256sum >/dev/null 2>&1; then
+      normalized_id="seq-$(printf '%s' "$raw_id" | sha256sum | cut -c1-16)"
+    elif command -v shasum >/dev/null 2>&1; then
+      normalized_id="seq-$(printf '%s' "$raw_id" | shasum -a 256 | cut -c1-16)"
+    else
+      normalized_id="seq-$(date +%s)"
+    fi
+  fi
+
+  printf '%s\n' "$normalized_id"
+}
+
+send_ntfy() {
+  local ntfy_title="${1:-}"
+  local ntfy_message="${2:-}"
+  local effective_title="$title"
+  local effective_message="$message"
+  local ntfy_header_title=""
+  local ntfy_header_id=""
+  local ntfy_header_click=""
+
+  if [[ -n "$ntfy_title" ]]; then
+    effective_title="$ntfy_title"
+  fi
+  if [[ -n "$ntfy_message" ]]; then
+    effective_message="$ntfy_message"
+  fi
+
+  ntfy_header_title="$(normalize_ntfy_title "$effective_title")"
+  if [[ -n "$notify_id" ]]; then
+    ntfy_header_id="$(normalize_ntfy_sequence_id "$notify_id")"
+  fi
+  if [[ -n "$click_url" ]]; then
+    ntfy_header_click="$(normalize_ntfy_click_url "$click_url")"
+  fi
+
+  local endpoint="http://127.0.0.1:8080/fedora"
+  if [[ -n "${NOTIFY_NTFY_ENDPOINT:-}" ]]; then
+    endpoint="$NOTIFY_NTFY_ENDPOINT"
+  fi
+
+  if command -v xh >/dev/null 2>&1; then
+    local -a xh_args=(--quiet --ignore-stdin --timeout 5 POST "$endpoint" "Title:$ntfy_header_title")
+    if [[ -n "$ntfy_header_id" ]]; then
+      xh_args+=("X-Sequence-ID:$ntfy_header_id")
+    fi
+    if [[ -n "$ntfy_header_click" ]]; then
+      xh_args+=("Click:$ntfy_header_click")
+    fi
+    xh_args+=(--raw "$effective_message")
+    run_cmd xh "${xh_args[@]}" >/dev/null 2>&1 &
+    return 0
+  fi
+
+  if command -v curl >/dev/null 2>&1; then
+    local -a curl_args=(-fsS --max-time 5 -H "Title: $ntfy_header_title")
+    if [[ -n "$ntfy_header_id" ]]; then
+      curl_args+=(-H "X-Sequence-ID: $ntfy_header_id")
+    fi
+    if [[ -n "$ntfy_header_click" ]]; then
+      curl_args+=(-H "Click: $ntfy_header_click")
+    fi
+    curl_args+=(-d "$effective_message" "$endpoint")
+    run_cmd curl "${curl_args[@]}" >/dev/null 2>&1 &
+    return 0
+  fi
+
+  return 1
+}
+
+maybe_send_ntfy() {
+  local ntfy_title="${1:-}"
+  local ntfy_message="${2:-}"
+  should_send_ntfy || return 0
+  send_ntfy "$ntfy_title" "$ntfy_message"
+}
+
+supports_notify_action() {
+  can_send_notify_send || return 1
+  run_cmd notify-send --help 2>/dev/null | grep -q -- '--action'
+}
+
+open_click_target() {
+  local target="${1:-}"
+
+  [[ -n "$target" ]] || return 1
+
+  if command -v xdg-open >/dev/null 2>&1; then
+    run_cmd xdg-open "$target" >/dev/null 2>&1 &
+    return 0
+  fi
+
+  if command -v gio >/dev/null 2>&1; then
+    run_cmd gio open "$target" >/dev/null 2>&1 &
+    return 0
+  fi
+
+  return 1
+}
+
+focus_konsole_panel() {
+  local service="$1"
+  local window="$2"
+  local session_path="$3"
+  local window_id="$4"
+  local session_id
+  local switched=0
+
+  session_id="${session_path#/Sessions/}"
+
+  if [[ "$session_id" =~ ^[0-9]+$ ]]; then
+    if command -v gdbus >/dev/null 2>&1; then
+      if run_cmd gdbus call --session --dest "$service" --object-path "$window" --method org.kde.konsole.Window.setCurrentSession "$session_id" >/dev/null 2>&1; then
+        switched=1
+      fi
+    elif command -v qdbus >/dev/null 2>&1; then
+      if run_cmd qdbus "$service" "$window" setCurrentSession "$session_id" >/dev/null 2>&1; then
+        switched=1
+      fi
+    fi
+  fi
+
+  if [[ -n "$window_id" ]]; then
+    if command -v wmctrl >/dev/null 2>&1; then
+      run_cmd wmctrl -ia "$window_id" >/dev/null 2>&1
+    elif command -v xdotool >/dev/null 2>&1; then
+      run_cmd xdotool windowactivate "$window_id" >/dev/null 2>&1
+    fi
+  fi
+
+  [[ "$switched" == "1" ]]
+}
+
+get_konsole_tab_name() {
+  local service="$1"
+  local session_path="$2"
+  local tab_name=""
+
+  if command -v gdbus >/dev/null 2>&1; then
+    tab_name="$(run_cmd gdbus call --session --dest "$service" --object-path "$session_path" --method org.freedesktop.DBus.Properties.Get org.kde.konsole.Session title 2>/dev/null | sed -E "s/^\(<'(.*)'\>,\)$/\1/")"
+  elif command -v qdbus >/dev/null 2>&1; then
+    tab_name="$(run_cmd qdbus "$service" "$session_path" title 2>/dev/null || true)"
+  fi
+
+  if [[ -n "$tab_name" ]]; then
+    printf '%s\n' "$tab_name"
+    return 0
+  fi
+
+  return 1
+}
+
+notify_timeout_sec=5
+
+send_clickable_notify() {
+  local timeout_ms="$1"
+  local timeout_sec="$2"
+  local notify_title="$3"
+  local notify_message="$4"
+  local action_label="Focus this Konsole panel"
+
+  if [[ -n "$click_url" ]]; then
+    action_label="Open link"
+  fi
+
+  can_send_notify_send || return 1
+
+  if command -v timeout >/dev/null 2>&1 && [[ "$timeout_sec" -gt 0 ]]; then
+    run_cmd timeout "${timeout_sec}s" notify-send --app-name "$app_name" --icon "preferences-desktop-notification-bell" --wait --expire-time "$timeout_ms" --action "default=$action_label" "$notify_title" "$notify_message"
+  else
+    run_cmd notify-send --app-name "$app_name" --icon "preferences-desktop-notification-bell" --wait --expire-time "$timeout_ms" --action "default=$action_label" "$notify_title" "$notify_message"
+  fi
+}
+
+spawn_persistent_click_listener() {
+  local notify_title="$1"
+  local notify_message="$2"
+  local service="$3"
+  local window="$4"
+  local session_path="$5"
+  local window_id="$6"
+  local timeout_ms="$7"
+
+  command -v nohup >/dev/null 2>&1 || return 1
+
+  local self_path
+  self_path="${BASH_SOURCE[0]}"
+  [[ -n "$self_path" ]] || return 1
+
+  run_cmd nohup env \
+    NOTIFY_CLICK_TITLE="$notify_title" \
+    NOTIFY_CLICK_MESSAGE="$notify_message" \
+    NOTIFY_CLICK_URL="$click_url" \
+    NOTIFY_CLICK_APP_NAME="$app_name" \
+    NOTIFY_CLICK_SERVICE="$service" \
+    NOTIFY_CLICK_WINDOW="$window" \
+    NOTIFY_CLICK_SESSION="$session_path" \
+    NOTIFY_CLICK_WINDOW_ID="$window_id" \
+    NOTIFY_CLICK_TIMEOUT_MS="$timeout_ms" \
+    "$self_path" --await-click >/dev/null 2>&1 &
+}
+
+if [[ $# -ge 1 ]] && [[ "$1" == "--await-click" ]]; then
+  click_title="${NOTIFY_CLICK_TITLE:-}"
+  click_message="${NOTIFY_CLICK_MESSAGE:-}"
+  click_url="${NOTIFY_CLICK_URL:-$click_url}"
+  app_name="${NOTIFY_CLICK_APP_NAME:-$app_name}"
+  click_service="${NOTIFY_CLICK_SERVICE:-}"
+  click_window="${NOTIFY_CLICK_WINDOW:-}"
+  click_session="${NOTIFY_CLICK_SESSION:-}"
+  click_window_id="${NOTIFY_CLICK_WINDOW_ID:-}"
+  click_timeout_ms="${NOTIFY_CLICK_TIMEOUT_MS:-0}"
+
+  if [[ -z "$click_title" && -z "$click_message" ]]; then
+    exit 1
+  fi
+
+  action="$(send_clickable_notify "$click_timeout_ms" 0 "$click_title" "$click_message")"
+  action_status=$?
+  if [[ $action_status -eq 0 ]]; then
+    if [[ "$action" == "default" ]]; then
+      if [[ -n "$click_url" ]]; then
+        open_click_target "$click_url"
+      else
+        focus_konsole_panel "$click_service" "$click_window" "$click_session" "$click_window_id"
+      fi
+    fi
+    exit 0
+  fi
+
+  if maybe_send_ntfy "$click_title" "$click_message"; then
+    exit 0
+  fi
+
+  exit 1
+fi
+
+in_konsole=0
+if [[ -n "${KONSOLE_DBUS_SERVICE:-}" ]] && [[ -n "${KONSOLE_DBUS_WINDOW:-}" ]] && [[ -n "${KONSOLE_DBUS_SESSION:-}" ]]; then
+  in_konsole=1
+fi
+
+if [[ "$app_name_explicit" -eq 0 ]]; then
+  if [[ "$in_konsole" == "1" ]]; then
+    app_name="$(get_konsole_tab_name "$KONSOLE_DBUS_SERVICE" "$KONSOLE_DBUS_SESSION" || true)"
+  fi
+  if [[ -z "$app_name" ]]; then
+    app_name="System Monitor"
+  fi
+  notify_send_args=(--app-name "$app_name" "${notify_send_args[@]}")
+fi
+
+if [[ "$in_konsole" == "1" ]] && supports_notify_action; then
+  konsole_window_id=""
+  if command -v xdotool >/dev/null 2>&1; then
+    konsole_window_id="$(run_cmd xdotool getactivewindow 2>/dev/null || true)"
+  fi
+
+  if [[ "$notify_timeout_ms" -eq 0 ]]; then
+    if spawn_persistent_click_listener "$title" "$message" "$KONSOLE_DBUS_SERVICE" "$KONSOLE_DBUS_WINDOW" "$KONSOLE_DBUS_SESSION" "$konsole_window_id" "$notify_timeout_ms"; then
+      maybe_send_ntfy "$title" "$message"
+      exit 0
+    fi
+  fi
+
+  action="$(send_clickable_notify "$notify_timeout_ms" "$notify_timeout_sec" "$title" "$message")"
+  action_status=$?
+  if [[ $action_status -eq 0 ]]; then
+    if [[ "$action" == "default" ]]; then
+      if [[ -n "$click_url" ]]; then
+        open_click_target "$click_url"
+      else
+        focus_konsole_panel "$KONSOLE_DBUS_SERVICE" "$KONSOLE_DBUS_WINDOW" "$KONSOLE_DBUS_SESSION" "$konsole_window_id"
+      fi
+    fi
+    maybe_send_ntfy "$title" "$message"
+    exit 0
+  fi
+else
+  if can_send_notify_send; then
+    if [[ -n "$click_url" ]] && supports_notify_action; then
+      action="$(send_clickable_notify "$notify_timeout_ms" "$notify_timeout_sec" "$title" "$message")"
+      action_status=$?
+      if [[ $action_status -eq 0 ]]; then
+        if [[ "$action" == "default" ]]; then
+          open_click_target "$click_url"
+        fi
+        maybe_send_ntfy "$title" "$message"
+        exit 0
+      fi
+    fi
+
+    if run_cmd notify-send "${notify_send_args[@]}"; then
+      maybe_send_ntfy "$title" "$message"
+      exit 0
+    fi
+  fi
+fi
+
+if maybe_send_ntfy; then
+  exit 0
+fi
+
+exit 1

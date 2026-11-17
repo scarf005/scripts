@@ -1,0 +1,113 @@
+#!/usr/bin/env -S renk script
+---
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+indicatif = "0.17"
+itertools = "0.15"
+mime2ext = "0.1"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+ureq = { version = "3", features = ["json"] }
+url = "2"
+---
+
+use std.path.PathBuf
+
+use clap.Parser
+use indicatif.ProgressBar
+use itertools.Itertools
+use serde.Deserialize
+
+type Error = Box[dyn std.error.Error + Send + Sync]
+
+/// Download a DCCon package
+#[derive(Parser)]
+#[command(name = "dccon", bin_name = "dccon", version = None)]
+struct Cli:
+    /// Output directory (single URL only)
+    #[arg(short, long, value_name = "path")]
+    output: Option[PathBuf]
+    /// DCCon package URLs, downloaded one after another
+    #[arg(required = true, value_name = "url")]
+    urls: Vec[String]
+
+#[derive(Deserialize)]
+struct DcconDetail:
+    info: Info
+    detail: Vec[Entry]
+
+#[derive(Deserialize)]
+struct Info:
+    title: String
+
+#[derive(Deserialize)]
+struct Entry:
+    path: String
+
+const HEADERS: [(&str, &str); 3] = [("Referer", "https://dccon.dcinside.com/"), ("X-Requested-With", "XMLHttpRequest"), ("User-Agent", "Mozilla/5.0")]
+
+fn sanitize_filename(name: &str) -> String:
+    let invalid = regex::Regex.new(r#"[/\\:*?"<>|\x00-\x1f]"#).unwrap()
+    let cleaned = invalid.replace_all(name.trim(), "_").trim_end_matches('.').to_string()
+    if cleaned.is_empty() then "dccon".to_string() else cleaned
+
+fn extension(content_type: &str) -> String:
+    let essence = content_type.split(';').next().unwrap_or("").trim().to_lowercase()
+    match mime2ext::mime2ext(&essence):
+        Some("jpg") => "jpeg".to_string()
+        Some(ext) => ext.to_string()
+        None => "bin".to_string()
+
+fn download(index: usize, path: &str, output_dir: &std.path.Path) -> Result[(), Error]:
+    let mut image_url = url.Url.parse("https://dcimg5.dcinside.com/dccon.php")?
+    image_url.query_pairs_mut().append_pair("no", path)
+    let mut request = ureq.get(image_url.as_str())
+    for (name, value) in HEADERS:
+        request = request.header(name, value)
+    let mut response = request.call()?
+    let content_type = response.headers().get("content-type").and_then(|value| value.to_str().ok()).unwrap_or("").to_string()
+    let filename = format!("{index + 1:03}.{extension(&content_type)}")
+    std.fs.write(output_dir.join(filename), response.body_mut().read_to_vec()?)?
+    Ok(())
+
+fn download_package(link: &str, output: Option[&PathBuf]) -> Result[(), Error]:
+    let package_idx = url.Url.parse(link)?.fragment().unwrap_or("").to_string()
+    if package_idx.is_empty() || !package_idx.bytes().all(|byte| byte.is_ascii_digit()):
+        return Err(format!("Invalid DCCon URL: {link}").into())
+
+    let mut request = ureq.post("https://dccon.dcinside.com/index/package_detail")
+    for (name, value) in HEADERS:
+        request = request.header(name, value)
+    let DcconDetail{ info, detail } = request.send_form([("package_idx", package_idx.as_str())])?.body_mut().read_json[DcconDetail]()?
+
+    let output_dir = output.cloned().unwrap_or_else(|| PathBuf.from(sanitize_filename(&info.title)))
+    std.fs.create_dir_all(&output_dir)?
+
+    let progress = ProgressBar.new(detail.len() as u64)
+    progress.set_message(format!("Downloading {info.title}"))
+    let results: Vec[Result[(), Error]] = std.thread.scope(|scope|:
+        let (output_dir, progress) = (&output_dir, &progress)
+        let handles = detail.iter().enumerate().map(|(index, entry)| scope.spawn(move || download(index, &entry.path, output_dir).inspect(|_| progress.inc(1)))).collect_vec()
+        handles.into_iter().map(|handle| handle.join().unwrap()).collect_vec()
+    )
+    progress.finish()
+    results.into_iter().collect[Result[Vec[_], _]]()?
+
+    println!("Saved to {output_dir.display()}")
+    Ok(())
+
+fn run(cli: Cli) -> Result[(), Error]:
+    if cli.output.is_some() && cli.urls.len() > 1:
+        return Err("-o/--output can only be used with a single URL".into())
+
+    let (_, failures): (Vec[()], Vec[Error]) = cli.urls.iter()
+        .map(|link| download_package(link, cli.output.as_ref()).inspect_err(|err| eprintln!("error: {link}: {err}")))
+        .partition_result()
+    if !failures.is_empty():
+        return Err(format!("{failures.len()} of {cli.urls.len()} packages failed").into())
+    Ok(())
+
+fn main():
+    if let Err(err) = run(Cli.parse()):
+        eprintln!("error: {err}")
+        std.process.exit(1)

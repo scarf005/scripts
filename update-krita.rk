@@ -1,0 +1,60 @@
+#!/usr/bin/env -S renk script
+---
+[dependencies]
+scraper = "0.23"
+ureq = "3"
+---
+
+use std::os::unix::fs::PermissionsExt
+use std::process::Command
+
+const KRITA_URL: &str = "https://cdn.kde.org/ci-builds/graphics/krita/master/linux/"
+
+type Error = Box[dyn std.error.Error]
+
+fn agent() -> ureq.Agent = ureq.Agent.config_builder().http_status_as_error(false).build().into()
+
+fn get_latest_app_image() -> Result[Option[String], Error]:
+    let html = agent().get(KRITA_URL).call()?.body_mut().read_to_string()?
+    let document = scraper::Html.parse_document(&html)
+    let selector = scraper::Selector.parse(r#"a[href*="x86_64.AppImage"]"#).unwrap()
+    let href = document.select(&selector).next().and_then(|a| a.value().attr("href")).map(String.from)
+    match &href:
+        Some(href) => println!("Found AppImage: {href}")
+        None => println!("Found AppImage: undefined")
+    Ok(href)
+
+fn download_file(url: &str) -> Result[Vec[u8], Error]:
+    let mut response = agent().get(url).call()?
+    if !response.status().is_success():
+        return Err(format!("Failed to download: {response.status().as_u16()}").into())
+    Ok(response.body_mut().with_config().limit(u64.MAX).read_to_vec()?)
+
+fn update_krita(latest_file: &str, target_dir: &str, target_file: &str) -> Result[(), Error]:
+    println!("Downloading {latest_file}...")
+    let new_file = download_file(&format!("{KRITA_URL}{latest_file}"))?
+
+    if std.fs.read(target_file).ok().as_ref() == Some(&new_file):
+        println!("Version unchanged, skipping")
+        return Ok(())
+
+    std.fs.create_dir_all(target_dir)?
+    std.fs.write(target_file, &new_file)?
+    std.fs.set_permissions(target_file, std.fs.Permissions.from_mode(0o755))?
+    println!("Updated successfully")
+    Command.new("notify-send").args(["Krita Update", &format!("Krita nightly updated: {latest_file}")]).output()?
+    Ok(())
+
+fn run() -> Result[(), Error]:
+    let home = std.env.var("HOME")?
+    let target_dir = format!("{home}/.local/bin")
+    let target_file = format!("{target_dir}/krita.AppImage")
+    let Some(latest_file) = get_latest_app_image()? else:
+        eprintln!("No AppImage found")
+        std.process.exit(1)
+    update_krita(&latest_file, &target_dir, &target_file)
+
+fn main():
+    if let Err(err) = run():
+        eprintln!("error: {err}")
+        std.process.exit(1)

@@ -1,0 +1,18 @@
+#!/usr/bin/env -S renk script
+---
+[dependencies]
+regex = "1"
+---
+
+fn main():
+    let Some(path) = std.env.args().nth(1) else:
+        eprintln!("error: missing path")
+        std.process.exit(1)
+    let logs = match std.fs.read_to_string(&path):
+        Ok(logs) => logs
+        Err(err) =>:
+            eprintln!("error: {err}")
+            std.process.exit(1)
+    let timestamp = regex::Regex.new(r"(?m)^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z\s").unwrap()
+    let cleaned = timestamp.replace_all(&logs, "")
+    println!("{cleaned}")

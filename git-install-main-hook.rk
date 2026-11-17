@@ -1,0 +1,57 @@
+#!/usr/bin/env -S renk script
+---
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+---
+
+use clap::Parser
+use std::os::unix::fs::PermissionsExt
+
+const PRE_PUSH_CONTENT: &str = r#"#!/bin/sh
+while read local_ref local_sha remote_ref remote_sha
+do
+    if [ "$remote_ref" = "refs/heads/main" ]; then
+        echo "[ERROR] Direct push to 'main' branch is prohibited."
+        exit 1
+    fi
+done"#
+
+const PRE_COMMIT_CONTENT: &str = r#"#!/bin/sh
+branch="$(git rev-parse --abbrev-ref HEAD)"
+if [ "$branch" = "main" ]; then
+    echo "[ERROR] Direct commit to 'main' branch is prohibited."
+    echo "Please work on a feature branch and use a Pull Request."
+    exit 1
+fi"#
+
+/// Installs git hooks to prevent direct commits and pushes to the main branch.
+#[derive(Parser)]
+#[command(name = "git-install-main-protection-hooks", bin_name = "git-install-main-protection-hooks", version = "1.1.0")]
+struct Cli
+
+fn git_common_dir() -> Option[String]:
+    let out = std.process.Command.new("git").args(["rev-parse", "--git-common-dir"]).output().ok()?
+    out.status.success().then(|| String.from_utf8_lossy(&out.stdout).trim().to_string())
+
+fn install_hook(hooks_dir: &std.path.Path, filename: &str, content: &str) -> std.io.Result[std.path.PathBuf]:
+    let path = hooks_dir.join(filename)
+    std.fs.create_dir_all(hooks_dir)?
+    std.fs.write(&path, content)?
+    std.fs.set_permissions(&path, std.fs.Permissions.from_mode(0o755))?
+    Ok(path)
+
+fn main():
+    Cli.parse()
+    let Some(common_dir) = git_common_dir() else:
+        eprintln!("❌ Error: Not a git repository.")
+        std.process.exit(1)
+    let hooks_dir = std.path.Path.new(&common_dir).join("hooks")
+    let hooks = [("pre-push", PRE_PUSH_CONTENT), ("pre-commit", PRE_COMMIT_CONTENT)]
+    let installed = hooks.iter().map(|(name, content)| install_hook(&hooks_dir, name, content)).collect[std.io.Result[Vec[_]]]()
+    match installed:
+        Ok(paths) =>:
+            for path in paths:
+                println!("✅ Hook successfully installed at: {path.display()}")
+        Err(err) =>:
+            eprintln!("❌ Failed to install hooks: {err}")
+            std.process.exit(1)

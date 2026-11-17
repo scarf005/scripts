@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Runs a pi (gpt-6.1-sol) implementation task non-interactively and keeps a readable report.
+# Usage: gpt-impl <session-id> <brief-file> [workdir] [thinking]
+#   Reusing a session-id continues that session. Logs and reports go to $GPT_IMPL_STATE
+#   (default ~/.local/state/gpt-impl): <id>.<run>.jsonl (full events) and <id>.<run>.md (every
+#   assistant text of the run, final one last). Prints the report path, then the longest of the last
+#   few assistant texts (the final report; trailing late acknowledgements are short).
+set -euo pipefail
+
+if [[ $# -lt 2 ]]; then
+	sed -n '2,6p' "$0" >&2
+	exit 2
+fi
+id=$1
+brief=$2
+workdir=${3:-$PWD}
+thinking=${4:-medium}
+model=${GPT_IMPL_MODEL:-openai-codex/gpt-6.1-sol}
+state=${GPT_IMPL_STATE:-$HOME/.local/state/gpt-impl}
+mkdir -p "$state/sessions"
+
+run=$(date +%Y%m%d-%H%M%S)
+log="$state/$id.$run.jsonl"
+report="$state/$id.$run.md"
+
+cd "$workdir"
+status=0
+# A print run ends when the agent settles, so work handed to async subagents outlives it and the report never comes:
+# the implementer does the work itself, in this session, until its final report.
+pi -p --mode json --model "$model" --thinking "$thinking" \
+	--exclude-tools subagent,subagents_enable,subagent_supervisor,parallel,ask_user \
+	--append-system-prompt "You are running non-interactively: this process exits as soon as you end your turn, and nothing you start in the background is collected afterwards. Do all the work yourself in this session with your own tools, wait for every command you start, and end your turn only with the final report the task asks for." \
+	--session-dir "$state/sessions" --session-id "$id" "$(cat "$brief")" >"$log" 2>"$log.err" || status=$?
+
+jq -r 'select(.type == "message_end" and .message.role == "assistant")
+	| [.message.content[]? | select(.type == "text") | .text] | join("\n")
+	| select(length > 0) | . + "\n\n---\n"' "$log" >"$report"
+
+echo "report: $report (exit $status)"
+jq -rs '[.[] | select(.type == "message_end" and .message.role == "assistant")
+	| [.message.content[]? | select(.type == "text") | .text] | join("\n") ] | .[-8:] | max_by(length) // ""' "$log"
+exit "$status"

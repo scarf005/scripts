@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SESSION=${PI_TMUX_SESSION:-pi-harness}
+MODE=${PI_TMUX_MODE:-fork}
+MATCH_RE=${PI_HARNESS_MATCH_RE:-'(@earendil-works/pi-coding-agent|pi-coding-agent|/dist/cli\.js|(^|[[:space:]])pi([[:space:]]|$))'}
+DRY_RUN=0
+LIST_ONLY=0
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+SELF_BASE=$(basename "$SELF")
+
+usage() {
+  cat <<USAGE
+Usage: ${SELF_BASE} [options]
+
+Create one tmux session per running pi harness. Defaults to forking saved pi sessions because reptyr is unreliable for pi's TUI input.
+
+Options:
+  -s, --session NAME   tmux session name prefix (default: ${SESSION})
+  -m, --match REGEX    process args regex (default: ${MATCH_RE})
+  -n, --dry-run        print what would be moved
+  -l, --list           list matching processes only
+  -h, --help           show this help
+
+Environment:
+  PI_TMUX_SESSION      default tmux session name
+  PI_HARNESS_MATCH_RE  default process args regex
+  PI_TMUX_MODE         fork (default) or reptyr
+  REPTYR_FLAGS         flags passed to reptyr in reptyr mode
+USAGE
+}
+
+proc_env_value() {
+  local pid=$1
+  local key=$2
+
+  tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null |
+    awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }'
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || {
+    printf 'error: required command not found: %s\n' "$1" >&2
+    return 1
+  }
+}
+
+process_ppid() {
+  ps -o ppid= -p "$1" 2>/dev/null | tr -d '[:space:]'
+}
+
+process_comm() {
+  ps -o comm= -p "$1" 2>/dev/null | awk '{print $1}'
+}
+
+has_tmux_ancestor() {
+  local pid=$1
+  local ppid comm
+
+  while [[ -n "$pid" && "$pid" != 0 && "$pid" != 1 ]]; do
+    comm=$(process_comm "$pid" || true)
+    [[ "$comm" == tmux || "$comm" == tmux:* ]] && return 0
+    ppid=$(process_ppid "$pid" || true)
+    [[ -z "$ppid" || "$ppid" == "$pid" ]] && return 1
+    pid=$ppid
+  done
+
+  return 1
+}
+
+has_tmux_tty() {
+  local pid=$1
+  local tty
+
+  command -v tmux >/dev/null 2>&1 || return 1
+  tty=$(readlink "/proc/$pid/fd/0" 2>/dev/null || true)
+  [[ -n "$tty" ]] || return 1
+  tmux list-panes -a -F '#{pane_tty}' 2>/dev/null | grep -Fxq "$tty"
+}
+
+has_reptyr_proxy() {
+  local pid=$1
+  local args
+
+  ps -u "${USER:?}" -o args= -C reptyr 2>/dev/null |
+    while IFS= read -r args; do
+      [[ "$args" =~ (^|[[:space:]])reptyr([[:space:]].*)?[[:space:]]$pid$ ]] && return 0
+    done
+}
+
+list_matches() {
+  local pid ppid sid tty stat args
+
+  ps -u "${USER:?}" -o pid=,ppid=,sid=,tty=,stat=,args= |
+    while read -r pid ppid sid tty stat args; do
+      [[ -n "${pid:-}" ]] || continue
+      [[ "$pid" == "$$" || "$ppid" == "$$" ]] && continue
+      [[ "${args:-}" =~ $MATCH_RE ]] || continue
+      [[ "${args:-}" == *"$SELF"* || "${args:-}" == *"$SELF_BASE"* ]] && continue
+      [[ "${args:-}" == *"reptyr"* ]] && continue
+      has_tmux_ancestor "$pid" && continue
+      has_tmux_tty "$pid" && continue
+      has_reptyr_proxy "$pid" && continue
+      printf '%s\t%s\t%s\t%s\t%s\n' "$pid" "$sid" "$tty" "$stat" "$args"
+    done
+}
+
+session_title_from_file() {
+  local file=$1
+  local title
+
+  command -v jq >/dev/null 2>&1 || return 1
+  [[ -f "$file" ]] || return 1
+
+  title=$(jq -r 'select(.type == "session_info" and (.name? // "") != "") | .name' "$file" 2>/dev/null | tail -n 1)
+  if [[ -n "$title" && "$title" != null ]]; then
+    printf '%s\n' "$title"
+    return 0
+  fi
+
+  jq -r '
+    select(.type == "message" and .message.role == "user")
+    | .message.content
+    | if type == "string" then .
+      else map(select(.type == "text") | .text) | join(" ")
+      end
+  ' "$file" 2>/dev/null | awk 'NF { print; exit }'
+}
+
+session_file_from_cmdline() {
+  local pid=$1
+  local cwd=$2
+  local arg next candidate
+  local -a argv
+
+  mapfile -d '' -t argv < "/proc/$pid/cmdline" 2>/dev/null || return 1
+  for ((i = 0; i < ${#argv[@]}; i++)); do
+    arg=${argv[$i]}
+    case "$arg" in
+      --session=*)
+        candidate=${arg#--session=}
+        ;;
+      --session)
+        next=$((i + 1))
+        ((next < ${#argv[@]})) || continue
+        candidate=${argv[$next]}
+        ;;
+      *)
+        continue
+        ;;
+    esac
+
+    [[ -n "${candidate:-}" ]] || continue
+    [[ "$candidate" == /* ]] || candidate="$cwd/$candidate"
+    [[ -f "$candidate" ]] && printf '%s\n' "$candidate" && return 0
+  done
+
+  return 1
+}
+
+session_file_from_fd() {
+  local pid=$1
+
+  find "/proc/$pid/fd" -maxdepth 1 -type l -lname '*.jsonl' -printf '%l\n' 2>/dev/null |
+    head -n 1
+}
+
+session_dir_for_pid() {
+  local pid=$1
+  local cwd=$2
+  local session_dir agent_dir home safe
+
+  session_dir=$(proc_env_value "$pid" PI_CODING_AGENT_SESSION_DIR || true)
+  if [[ -n "$session_dir" ]]; then
+    printf '%s\n' "${session_dir/#\~/$HOME}"
+    return 0
+  fi
+
+  agent_dir=$(proc_env_value "$pid" PI_CODING_AGENT_DIR || true)
+  if [[ -z "$agent_dir" ]]; then
+    home=$(proc_env_value "$pid" HOME || true)
+    agent_dir="${home:-$HOME}/.pi/agent"
+  fi
+
+  safe=${cwd#/}
+  safe=${safe//\//-}
+  safe=${safe//\\/-}
+  safe=${safe//:/-}
+  printf '%s/sessions/--%s--\n' "${agent_dir/#\~/$HOME}" "$safe"
+}
+
+session_file_from_start_time() {
+  local pid=$1
+  local cwd=$2
+  local dir
+
+  dir=$(session_dir_for_pid "$pid" "$cwd")
+  [[ -d "$dir" ]] || return 1
+  python3 - "$pid" "$dir" <<'PY'
+import datetime
+import glob
+import os
+import sys
+
+pid = sys.argv[1]
+dir_path = sys.argv[2]
+try:
+    clk = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+    with open("/proc/stat", "r", encoding="utf-8") as f:
+        btime = next(int(line.split()[1]) for line in f if line.startswith("btime "))
+    with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as f:
+        start = btime + int(f.read().split()[21]) / clk
+except Exception:
+    sys.exit(1)
+
+best = None
+for path in glob.glob(os.path.join(dir_path, "*.jsonl")):
+    stem = os.path.basename(path).split("_", 1)[0]
+    try:
+        epoch = datetime.datetime.strptime(stem, "%Y-%m-%dT%H-%M-%S-%fZ").replace(tzinfo=datetime.timezone.utc).timestamp()
+    except Exception:
+        epoch = os.path.getmtime(path)
+    candidate = (abs(epoch - start), path)
+    if best is None or candidate < best:
+        best = candidate
+
+if best:
+    print(best[1])
+PY
+}
+
+latest_session_file_for_pid() {
+  local pid=$1
+  local cwd=$2
+  local dir
+
+  dir=$(session_dir_for_pid "$pid" "$cwd")
+  [[ -d "$dir" ]] || return 1
+  find "$dir" -maxdepth 1 -type f -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null |
+    sort -rn |
+    head -n 1 |
+    cut -d' ' -f2-
+}
+
+session_file_for_pid() {
+  local pid=$1
+  local cwd=$2
+  local file
+
+  file=$(session_file_from_cmdline "$pid" "$cwd" || true)
+  [[ -n "$file" ]] && { printf '%s\n' "$file"; return 0; }
+
+  file=$(session_file_from_fd "$pid" || true)
+  [[ -n "$file" ]] && { printf '%s\n' "$file"; return 0; }
+
+  file=$(session_file_from_start_time "$pid" "$cwd" || true)
+  [[ -n "$file" ]] && { printf '%s\n' "$file"; return 0; }
+
+  latest_session_file_for_pid "$pid" "$cwd"
+}
+
+tmux_safe_text() {
+  tr '\r\n\t' '   ' | tr -d '[:cntrl:]'
+}
+
+shorten_with_suffix() {
+  local text=$1
+  local suffix=$2
+  local max=80
+  local keep=$((max - ${#suffix}))
+
+  ((keep < 1)) && keep=1
+  printf '%s%s\n' "${text:0:keep}" "$suffix"
+}
+
+tmux_safe_session_component() {
+  sed -E 's/[^A-Za-z0-9_.-]+/-/g; s/^-+//; s/-+$//; s/-+/-/g'
+}
+
+session_name_for_pid() {
+  local pid=$1
+  local cwd context safe_context name
+
+  cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)
+  context=$(basename "${cwd:-unknown}")
+  safe_context=$(printf '%s' "$context" | tmux_safe_text | tmux_safe_session_component)
+  [[ -n "$safe_context" ]] || safe_context=unknown
+  name="${SESSION}-${safe_context}-${pid}"
+  shorten_with_suffix "$name" ""
+}
+
+window_name_for_pid() {
+  printf 'pi\n'
+}
+
+attach_pid() {
+  local pid=$1
+  local flags_text=${REPTYR_FLAGS-}
+  local -a flags
+
+  need reptyr
+  [[ -d "/proc/$pid" ]] || {
+    printf 'error: process no longer exists: %s\n' "$pid" >&2
+    exit 1
+  }
+
+  read -r -a flags <<< "$flags_text"
+  printf 'Attaching pi harness PID %s with: reptyr %s %s\n' "$pid" "$flags_text" "$pid"
+  exec reptyr "${flags[@]}" "$pid"
+}
+
+make_session() {
+  local pid=$1
+  local session window cwd file pi_bin agent_dir
+  local cmd
+
+  session=$(session_name_for_pid "$pid")
+  window=$(window_name_for_pid "$pid")
+
+  if tmux has-session -t "$session" 2>/dev/null; then
+    printf 'skip PID %s: tmux session already exists: %s\n' "$pid" "$session" >&2
+    return 1
+  fi
+
+  if [[ "$MODE" == reptyr ]]; then
+    cmd=$(printf '%q --attach %q' "$SELF" "$pid")
+  else
+    cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)
+    [[ -n "$cwd" ]] || { printf 'skip PID %s: cannot read cwd\n' "$pid" >&2; return 1; }
+    file=$(session_file_for_pid "$pid" "$cwd" || true)
+    [[ -n "$file" ]] || { printf 'skip PID %s: cannot find pi session file\n' "$pid" >&2; return 1; }
+    pi_bin=$(command -v pi)
+    agent_dir=$(proc_env_value "$pid" PI_CODING_AGENT_DIR || true)
+    cmd=$(printf 'cd %q && %s exec %q --fork %q' "$cwd" "${agent_dir:+export PI_CODING_AGENT_DIR=$(printf '%q' "$agent_dir") &&}" "$pi_bin" "$file")
+  fi
+
+  tmux new-session -d -s "$session" -n "$window" "$cmd"
+  tmux set-option -t "$session" allow-rename off >/dev/null
+  tmux set-option -t "$session" automatic-rename off >/dev/null
+
+  printf 'created tmux session %s for PID %s window %s\n' "$session" "$pid" "$window"
+}
+
+main() {
+  while (($#)); do
+    case "$1" in
+      --attach)
+        shift
+        [[ $# -ge 1 ]] || { printf 'error: --attach requires PID\n' >&2; exit 2; }
+        attach_pid "$1"
+        exit 0
+        ;;
+      -s|--session)
+        shift
+        [[ $# -ge 1 ]] || { printf 'error: --session requires NAME\n' >&2; exit 2; }
+        SESSION=$1
+        ;;
+      -m|--match)
+        shift
+        [[ $# -ge 1 ]] || { printf 'error: --match requires REGEX\n' >&2; exit 2; }
+        MATCH_RE=$1
+        ;;
+      -n|--dry-run)
+        DRY_RUN=1
+        ;;
+      -l|--list)
+        LIST_ONLY=1
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        printf 'error: unknown option: %s\n' "$1" >&2
+        usage >&2
+        exit 2
+        ;;
+    esac
+    shift
+  done
+
+  if ((LIST_ONLY)); then
+    list_matches
+    exit 0
+  fi
+
+  if ((!DRY_RUN)); then
+    need tmux
+    if [[ "$MODE" == reptyr ]]; then
+      need reptyr
+    else
+      need pi
+      need python3
+    fi
+  fi
+
+  mapfile -t matches < <(list_matches)
+  if ((${#matches[@]} == 0)); then
+    printf 'no matching pi harness processes found outside tmux\n'
+    exit 0
+  fi
+
+  local row pid sid tty stat args
+  for row in "${matches[@]}"; do
+    IFS=$'\t' read -r pid sid tty stat args <<< "$row"
+    if [[ "$tty" == "?" ]]; then
+      printf 'skip PID %s: no controlling TTY: %s\n' "$pid" "$args" >&2
+      continue
+    fi
+
+    if ((DRY_RUN)); then
+      printf 'PID %s -> { session: %s, window: %s }\n' "$pid" "$(session_name_for_pid "$pid")" "$(window_name_for_pid "$pid")"
+    else
+      make_session "$pid"
+    fi
+  done
+
+  if ((!DRY_RUN)); then
+    printf 'attach with: tmux attach -t <session-name-from-output>\n'
+  fi
+}
+
+main "$@"
