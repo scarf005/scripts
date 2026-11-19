@@ -14,8 +14,10 @@ import tempfile
 PATCHED = os.path.expanduser('~/.local/share/claude-patched')
 VERSIONS = os.path.expanduser('~/.local/share/claude/versions')
 # Minified names change between releases, so match them as identifiers.
-ORIG = re.compile(rb'([\w$]+)=[\w$]+&&[\w$]+\.name!==[\w$]+&&e\([\w$]+,\{height:1,children:e\([\w$]+,'
-                  rb'\{dimColor:!0,children:"Allowed by auto mode(?: classifier)?"\}\)\}\)')
+# 2.1.327 and later render the row as one element with oneRow instead of a height:1 box around dim text.
+ORIG = re.compile(rb'([\w$]+)=[\w$]+&&[\w$]+\.name!==[\w$]+&&e\([\w$]+,\{(?:height:1,children:e\([\w$]+,'
+                  rb'\{dimColor:!0,children:"Allowed by auto mode(?: classifier)?"\}\)\}\)'
+                  rb'|oneRow:!0,children:"Allowed by auto mode(?: classifier)?"\}\))')
 MARK = b'// @bun @bytecode\n'
 
 
